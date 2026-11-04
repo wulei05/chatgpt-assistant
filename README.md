@@ -15,6 +15,7 @@ macOS **菜单栏 App**：根据本地 Codex **运行记录（rollout）** 发�
 5. 「系统设置 → 隐私与安全性」勾选 **ChatGPT助手**：
    - **macOS 27+**：入口叫 **设备控制和数据访问**（原「辅助功能」已改名）
    - **更早系统**：入口叫 **辅助功能**
+   - 若开关已开但 App 仍提示未授权：在列表里**删掉再重新添加** ChatGPT助手，然后**退出应用再打开**（macOS 27 + ad-hoc 签名常见）
 
 运行数据：`~/Library/Application Support/ChatGPT助手/`
 

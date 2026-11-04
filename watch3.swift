@@ -449,11 +449,18 @@ func findRow(_ name: String, _ ls: [Line]) -> (CGFloat, CGFloat, Double)? {
 // ---------- CUA Accessibility layer (AX first, like Codex Sky) ----------
 final class AxBridge {
     private(set) var trusted: Bool
+    private var lastPromptAt: Date = .distantPast
     init() {
         trusted = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
+        lastPromptAt = Date()
     }
-    func refreshTrust() {
-        trusted = AXIsProcessTrusted()
+    func refreshTrust(promptIfNeeded: Bool = false) {
+        if promptIfNeeded, !AXIsProcessTrusted(), Date().timeIntervalSince(lastPromptAt) > 45 {
+            trusted = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
+            lastPromptAt = Date()
+        } else {
+            trusted = AXIsProcessTrusted()
+        }
     }
     private func str(_ el: AXUIElement, _ name: String) -> String? {
         var v: AnyObject?
@@ -1577,7 +1584,7 @@ func runWatchDaemon() {
     writeState(badges: [], lastPoll: startDate)
 
     while true {
-        axBridge.refreshTrust()
+        axBridge.refreshTrust(promptIfNeeded: true)
         settings = loadSettings()
         if settings.maxRuntimeHours > 0 {
             let limit = settings.maxRuntimeHours * 3600

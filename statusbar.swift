@@ -357,9 +357,9 @@ final class Controller: NSObject, NSMenuDelegate {
         }
         if (s.state?["ax"] as? Bool) == false {
             let pane = AppPaths.accessibilityPrivacyName
-            meta("   ⚠ 未开「\(pane)」", color: .systemYellow)
-            meta("   系统设置 → 隐私与安全性 → \(pane) → 勾选 ChatGPT助手", color: .systemYellow)
-            meta("   改完后退出应用再打开（macOS 27+ 已无「辅助功能」入口）", color: .systemYellow)
+            meta("   ⚠ 系统判定未授权「\(pane)」", color: .systemYellow)
+            meta("   设置里开关开了也可能仍如此（macOS 27 常见）", color: .systemYellow)
+            meta("   处理：列表中删除 ChatGPT助手 → 再添加 → 退出应用重开", color: .systemYellow)
             let openAx = NSMenuItem(title: "打开「\(pane)」设置…", action: #selector(openAccessibilityPrivacy), keyEquivalent: "")
             openAx.target = self
             menu.addItem(openAx)
