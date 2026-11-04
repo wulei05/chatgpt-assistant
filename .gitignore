@@ -1,0 +1,33 @@
+# Build / binaries
+dist/
+chatgpt-assistant
+ChatGPTAssistantBar
+CodexWatchBar
+watch3
+watch3.prev
+cli
+crop
+key
+mpos
+probe2
+wstate
+
+# Runtime
+*.log
+*.err
+state.json
+handled.txt
+PAUSE
+STOP
+SCAN_NOW
+clip.bak
+
+# Debug captures / probes
+*.png
+mpos.swift
+probe2.swift
+wstate.swift
+
+# macOS
+.DS_Store
+*.dSYM/
