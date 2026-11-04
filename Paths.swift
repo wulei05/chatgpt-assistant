@@ -92,36 +92,79 @@ enum AppPaths {
         FileManager.default.createFile(atPath: marker, contents: nil)
     }
 
-    private static func shellEscape(_ s: String) -> String {
-        "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
-    }
+    private static var daemonThread: Thread?
+    private static var daemonProcess: Process?
 
-    /// Launch the daemon detached, writing logs under dataDir.
+    /// In the .app, run monitoring in-process so Accessibility TCC from `open` applies.
+    /// (Spawning `cgpt-daemon` as a child of a LaunchServices-launched app loses AX trust.)
     @discardableResult
     static func launchDaemon() -> Bool {
+        stopDaemon()
         try? FileManager.default.removeItem(atPath: stopPath)
+
+        if runningInAppBundle {
+            if let t = daemonThread, t.isExecuting { return true }
+            let t = Thread {
+                runWatchDaemon()
+            }
+            t.name = "cgpt-watch"
+            t.qualityOfService = .userInitiated
+            daemonThread = t
+            t.start()
+            return true
+        }
+
         let bin = daemonPath
         guard FileManager.default.isExecutableFile(atPath: bin) else { return false }
+        let outPath = dataDir + "/stdout.log"
+        let errPath = dataDir + "/daemon.err"
+        FileManager.default.createFile(atPath: outPath, contents: nil, attributes: nil)
+        FileManager.default.createFile(atPath: errPath, contents: nil, attributes: nil)
+        guard let out = FileHandle(forWritingAtPath: outPath),
+              let err = FileHandle(forWritingAtPath: errPath) else { return false }
+        out.seekToEndOfFile()
+        err.seekToEndOfFile()
 
-        let script = """
-        export CHATGPT_ASSISTANT_HOME=\(shellEscape(dataDir))
-        cd "$CHATGPT_ASSISTANT_HOME" || exit 1
-        # Kill previous instance if any
-        /usr/bin/pkill -x \(daemonBinaryName) 2>/dev/null || true
-        /bin/sleep 0.2
-        /usr/bin/nohup \(shellEscape(bin)) >>stdout.log 2>>daemon.err </dev/null &
-        """
         let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        p.arguments = ["-c", script]
-        p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
+        p.executableURL = URL(fileURLWithPath: bin)
+        var env = ProcessInfo.processInfo.environment
+        env["CHATGPT_ASSISTANT_HOME"] = dataDir
+        p.environment = env
+        p.currentDirectoryURL = URL(fileURLWithPath: dataDir)
+        p.standardOutput = out
+        p.standardError = err
+        p.standardInput = FileHandle.nullDevice
         do {
             try p.run()
-            p.waitUntilExit()
-            return p.terminationStatus == 0
+            daemonProcess = p
+            return true
         } catch {
             return false
         }
+    }
+
+    /// Stop daemon so Finder can replace/move the .app bundle.
+    static func stopDaemon() {
+        FileManager.default.createFile(atPath: stopPath, contents: nil)
+        let myPid = Int(ProcessInfo.processInfo.processIdentifier)
+        if let st = try? Data(contentsOf: URL(fileURLWithPath: statePath)),
+           let obj = try? JSONSerialization.jsonObject(with: st) as? [String: Any],
+           let pid = obj["pid"] as? Int, pid > 0, pid != myPid {
+            kill(pid_t(pid), SIGTERM)
+        }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+        p.arguments = ["-x", daemonBinaryName]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        try? p.run()
+        p.waitUntilExit()
+        if let t = daemonThread {
+            let deadline = Date().addingTimeInterval(4)
+            while t.isExecuting && Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+        }
+        daemonProcess = nil
     }
 }

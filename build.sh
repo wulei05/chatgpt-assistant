@@ -17,6 +17,7 @@ MACOS_MIN="${MACOS_MIN:-13.0}"
 mkdir -p "$OUT"
 
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist 2>/dev/null || echo 0.0.0)"
+BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' Info.plist 2>/dev/null || echo com.wulei05.chatgpt-assistant)"
 APP_NAME="ChatGPT Assistant"
 
 swift_target() {
@@ -41,14 +42,15 @@ build_bins_for_arch() {
   mkdir -p "$dest"
   local tmp
   tmp="$(mktemp -d)"
+  # Bar includes watch core so monitoring can run in-process (Accessibility TCC).
   cat Paths.swift watch3.swift > "$tmp/daemon.swift"
-  cat Paths.swift statusbar.swift > "$tmp/bar.swift"
+  cat Paths.swift watch3.swift statusbar.swift > "$tmp/bar.swift"
 
   echo "Building binaries (ARCH=$arch, macosx${MACOS_MIN})…"
   compile_one "$arch" "$tmp/daemon.swift" "$dest/cgpt-daemon" \
     -framework AppKit -framework ApplicationServices -framework CoreGraphics -framework Vision
   compile_one "$arch" "$tmp/bar.swift" "$dest/CGPTBar" \
-    -framework AppKit
+    -framework AppKit -framework ApplicationServices -framework CoreGraphics -framework Vision
   chmod +x "$dest/cgpt-daemon" "$dest/CGPTBar"
   rm -rf "$tmp"
   lipo -info "$dest/cgpt-daemon" || true
@@ -87,8 +89,18 @@ package_app_for_arch() {
   fi
   maybe_copy_helper "$arch" "$ROOT/cli" "$app_dir/Contents/MacOS"
   maybe_copy_helper "$arch" "$ROOT/key" "$app_dir/Contents/MacOS"
+  # Sign bundle first, then re-stamp every Mach-O with the app Bundle ID.
+  # (--deep alone leaves helpers with unique ad-hoc IDs, so Accessibility TCC
+  # granted to ChatGPT助手 would not cover cgpt-daemon, where AX actually runs.)
   codesign --force --deep --sign - "$app_dir" 2>/dev/null || true
-  echo "App: $app_dir (v${VERSION}, ARCH=$arch)"
+  for bin in CGPTBar cgpt-daemon cli key; do
+    if [[ -f "$app_dir/Contents/MacOS/$bin" ]]; then
+      codesign --force --sign - --identifier "$BUNDLE_ID" \
+        "$app_dir/Contents/MacOS/$bin" 2>/dev/null || true
+    fi
+  done
+  codesign --force --sign - --identifier "$BUNDLE_ID" "$app_dir" 2>/dev/null || true
+  echo "App: $app_dir (v${VERSION}, ARCH=$arch, id=$BUNDLE_ID)"
 }
 
 package_loose_for_arch() {

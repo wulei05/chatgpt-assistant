@@ -56,6 +56,8 @@ func loadSettings() -> WatchSettings {
     if let p = o["codexPath"] as? String, !p.isEmpty { s.codexPath = p }
     return s
 }
+/// Shared mutable settings (used by helpers + runWatchDaemon).
+var settings = loadSettings()
 func pidAlive(_ pid: pid_t) -> Bool {
     pid > 0 && kill(pid, 0) == 0
 }
@@ -1443,352 +1445,361 @@ if CommandLine.arguments.contains("--scan-badges") {
     exit(0)
 }
 // ---------- main ----------
-let stateFile = AppPaths.statePath
-let pauseFile = AppPaths.pausePath
-// Keep AppKit services alive for Vision/NSImage without becoming a dock app.
-_ = NSApplication.shared
-NSApp.setActivationPolicy(.accessory)
-try? FileManager.default.removeItem(atPath: stopFile)
-try? FileManager.default.removeItem(atPath: scanNowFile)
-axBridge.refreshTrust()
-var settings = loadSettings()
-let startDate = Date()
-let iso = ISO8601DateFormatter()
-let runtimeDesc = settings.maxRuntimeHours <= 0 ? "永久" : "\(settings.maxRuntimeHours) 小时"
-let targetHint: String = {
-    if settings.targetPid > 0 { return "targetPid=\(settings.targetPid)" }
-    return "bundle=\(settings.targetBundleId)"
-}()
-log("=== ChatGPT助手 启动 pid=\(ProcessInfo.processInfo.processIdentifier) AX=\(axBridge.trusted ? "on" : "off") 最长=\(runtimeDesc) 轮询=\(Int(settings.pollSec))s \(targetHint) agent-desktop=\(settings.useAgentDesktop ? "on" : "off") codex-queue=\(settings.useCodexQueue ? "on" : "off") ===")
-if !axBridge.trusted {
-    log("⚠ 未授予辅助功能权限：系统设置 → 隐私与安全性 → 辅助功能 → 勾选 watch3（CUA AX 路径需要）")
-}
-var lastBadgeTitles = ""
-var lastBadges: [Badge] = []
-var lastSendAt: [String: Date] = [:]
-/// title → `threadId:errorTurn` that was successfully continued; used to tell real false-success from a fresh 429.
-var lastSentKey: [String: String] = [:]
-var lastAttemptAt: [String: Date] = [:]
-var quickFails: [String: Int] = [:]
-var lastFailReason: [String: String] = [:]
-var lastBackoffNoteLeft: [String: Int] = [:]
-var badgeFirstSeen: [String: Date] = [:]
-var recentActions: [[String: String]] = []
-
-func clockString() -> String {
-    let f = DateFormatter(); f.dateFormat = "HH:mm:ss"; return f.string(from: Date())
-}
-func note(_ title: String, _ result: String, _ detail: String = "") {
-    recentActions.append(["ts": iso.string(from: Date()), "clock": clockString(),
-                          "title": title, "result": result, "detail": detail])
-    if recentActions.count > 25 { recentActions.removeFirst(recentActions.count - 25) }
-}
-var isBlind = false
-var isOffscreen = false
-func writeState(badges: [Badge], lastPoll: Date) {
-    let waits: [Double] = [0, 90, 180, 300, 600]
-    func nextRunInfo(title: String) -> (sec: Int, hint: String) {
-        var sec = 0
-        var hint = ""
-        if let sentAt = lastSendAt[title] {
-            let cool = 40 - lastPoll.timeIntervalSince(sentAt)
-            if cool > 0 {
-                sec = max(sec, Int(ceil(cool)))
-                hint = "刚发送过，冷却中"
-            }
-        }
-        let fails = quickFails[title] ?? 0
-        if fails > 0 {
-            let wait = waits[min(fails, waits.count - 1)]
-            let since = lastPoll.timeIntervalSince(lastAttemptAt[title] ?? lastSendAt[title] ?? .distantPast)
-            let left = wait - since
-            if left > 0 {
-                sec = max(sec, Int(ceil(left)))
-                hint = lastFailReason[title] ?? "退避中"
-            }
-        }
-        return (sec, hint)
-    }
-    var badgeArr: [[String: Any]] = []
-    for b in badges {
-        let first = badgeFirstSeen[b.title] ?? lastPoll
-        let next = nextRunInfo(title: b.title)
-        var row: [String: Any] = ["title": b.title,
-                                  "source": b.source,
-                                  "firstSeen": iso.string(from: first),
-                                  "waitingSec": Int(lastPoll.timeIntervalSince(first)),
-                                  "nextRunSec": next.sec,
-                                  "nextRunAt": iso.string(from: lastPoll.addingTimeInterval(Double(next.sec)))]
-        if !next.hint.isEmpty { row["nextRunHint"] = next.hint }
-        if let e = b.errorMsg, !e.isEmpty { row["error"] = String(e.prefix(120)) }
-        if let id = b.threadId { row["threadId"] = id }
-        badgeArr.append(row)
-    }
-    var backoffArr: [[String: Any]] = []
-    for (t, n) in quickFails where n > 0 {
-        let since = lastPoll.timeIntervalSince(lastAttemptAt[t] ?? lastSendAt[t] ?? .distantPast)
-        let w = waits[min(n, waits.count - 1)]
-        var row: [String: Any] = ["title": t, "count": n, "remainSec": max(0, Int(w - since))]
-        if let why = lastFailReason[t], !why.isEmpty { row["reason"] = why }
-        backoffArr.append(row)
-    }
-    let elapsed = lastPoll.timeIntervalSince(startDate)
-    let permanent = settings.maxRuntimeHours <= 0
-    let limitSec = permanent ? 0.0 : settings.maxRuntimeHours * 3600
-    var remain: Any = NSNull()
-    if !permanent { remain = max(0, Int(limitSec - elapsed)) }
-    var targetObj: [String: Any] = [
-        "mode": targetMeta?.mode ?? "none",
-        "pid": Int(targetMeta?.pid ?? 0),
-        "name": targetMeta?.name ?? "",
-        "bundleId": targetMeta?.bundleId ?? settings.targetBundleId,
-        "pinnedPid": Int(settings.targetPid)
-    ]
-    if preferredWin > 0 { targetObj["windowId"] = preferredWin }
-    let obj: [String: Any] = [
-        "pid": Int(getpid()),
-        "startedAt": iso.string(from: startDate),
-        "heartbeat": iso.string(from: lastPoll),
-        "pollSec": settings.pollSec,
-        "discoverMode": settings.discoverMode,
-        "paused": FileManager.default.fileExists(atPath: pauseFile),
-        "blind": isBlind,
-        "offscreen": isOffscreen,
-        "ax": axBridge.trusted,
-        "permanent": permanent,
-        "maxRuntimeHours": settings.maxRuntimeHours,
-        "remainSec": remain,
-        "target": targetObj,
-        "badges": badgeArr,
-        "actions": recentActions,
-        "backoff": backoffArr,
-        "manualScanAt": lastManualScanAt.map { iso.string(from: $0) } as Any? ?? NSNull(),
-        "version": 1
-    ]
-    if let d = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted]) {
-        try? d.write(to: URL(fileURLWithPath: stateFile))
-    }
-}
-
-// 立刻写心跳，避免首轮扫描时菜单栏仍显示「监控未运行」
-writeState(badges: [], lastPoll: startDate)
-
-while true {
+func runWatchDaemon() {
+    let stateFile = AppPaths.statePath
+    let pauseFile = AppPaths.pausePath
+    // Keep AppKit services alive for Vision/NSImage without becoming a dock app.
+    _ = NSApplication.shared
+    NSApp.setActivationPolicy(.accessory)
+    try? FileManager.default.removeItem(atPath: stopFile)
+    try? FileManager.default.removeItem(atPath: scanNowFile)
+    axBridge.refreshTrust()
     settings = loadSettings()
-    if settings.maxRuntimeHours > 0 {
-        let limit = settings.maxRuntimeHours * 3600
-        let elapsed = Date().timeIntervalSince(startDate)
-        if elapsed >= limit {
-            log("达到设定最长运行时间 \(settings.maxRuntimeHours) 小时，退出")
-            break
-        }
+    let startDate = Date()
+    let iso = ISO8601DateFormatter()
+    let runtimeDesc = settings.maxRuntimeHours <= 0 ? "永久" : "\(settings.maxRuntimeHours) 小时"
+    let targetHint: String = {
+        if settings.targetPid > 0 { return "targetPid=\(settings.targetPid)" }
+        return "bundle=\(settings.targetBundleId)"
+    }()
+    log("=== ChatGPT助手 启动 pid=\(ProcessInfo.processInfo.processIdentifier) AX=\(axBridge.trusted ? "on" : "off") 最长=\(runtimeDesc) 轮询=\(Int(settings.pollSec))s \(targetHint) agent-desktop=\(settings.useAgentDesktop ? "on" : "off") codex-queue=\(settings.useCodexQueue ? "on" : "off") ===")
+    if !axBridge.trusted {
+        log("⚠ 未授予辅助功能权限：系统设置 → 隐私与安全性 → 辅助功能 → 勾选 ChatGPT助手（AX 路径需要；与「设备控制」不是同一项）")
     }
-    if FileManager.default.fileExists(atPath: stopFile) { log("检测到 STOP，退出"); break }
-    let now = Date()
-    let paused = FileManager.default.fileExists(atPath: pauseFile)
-    writeState(badges: lastBadges, lastPoll: now)
-    let t0 = Date()
-    // PID first, then windows owned by that PID (works off-Space via CGWindowList + screencapture -l).
-    guard let target = resolveTargetPid(settings) else {
-        targetMeta = nil
-        isOffscreen = false
-        if Int(now.timeIntervalSince1970) % 30 < Int(settings.pollSec) {
-            log("⚠ 找不到监控目标（targetPid / \(settings.targetBundleId)）")
-        }
-        waitPoll(settings.pollSec); continue
-    }
-    if targetMeta?.pid != target.pid {
-        preferredWin = -1
-        log("ℹ 监控目标 \(target.name) pid=\(target.pid) mode=\(target.mode) bundle=\(target.bundleId)")
-    }
-    targetMeta = target
-    let pid = target.pid
-    let appName = target.name.isEmpty ? "ChatGPT" : target.name
-    let mode = "files"
-    let handled = loadHandled()
-    let threads = scanThreads()
-    let badges = fileWorkItems(threads, handled: handled)
-    isBlind = false
-    // 仅在有待办时解析窗口几何（发送要用）
-    if !badges.isEmpty, let (wid, _, on0) = windowInfo(pid) {
-        preferredWin = wid
-        let wasOff = isOffscreen
-        isOffscreen = !on0
-        if isOffscreen && !wasOff { log("ℹ \(target.name) 不在当前屏(其他 Space/被切走)，仍可后台操作") }
-        if !isOffscreen && wasOff { log("ℹ \(target.name) 已回到当前屏") }
-    } else if badges.isEmpty {
-        isOffscreen = false
-    }
+    var lastBadgeTitles = ""
+    var lastBadges: [Badge] = []
+    var lastSendAt: [String: Date] = [:]
+    /// title → `threadId:errorTurn` that was successfully continued; used to tell real false-success from a fresh 429.
+    var lastSentKey: [String: String] = [:]
+    var lastAttemptAt: [String: Date] = [:]
+    var quickFails: [String: Int] = [:]
+    var lastFailReason: [String: String] = [:]
+    var lastBackoffNoteLeft: [String: Int] = [:]
+    var badgeFirstSeen: [String: Date] = [:]
+    var recentActions: [[String: String]] = []
 
-    let pollMs = Int(Date().timeIntervalSince(t0) * 1000)
-    if pollMs > 1500 { log("⏱ 本轮检测 \(pollMs)ms mode=\(mode)") }
-    lastBadges = badges
-    let titles = Set(badges.map { $0.title })
-    for t in titles where badgeFirstSeen[t] == nil { badgeFirstSeen[t] = now }
-    for t in Array(badgeFirstSeen.keys) where !titles.contains(t) { badgeFirstSeen.removeValue(forKey: t) }
-    let sig = badges.map { "\($0.title)[\($0.source)]" }.joined(separator: " | ")
-    if sig != lastBadgeTitles {
-        log("待处理 \(badges.count) 个: \(sig.isEmpty ? "(无)" : sig)")
-        lastBadgeTitles = sig
+    func clockString() -> String {
+        let f = DateFormatter(); f.dateFormat = "HH:mm:ss"; return f.string(from: Date())
     }
-    var manualForceRetry = false
-    if pendingManualScan {
-        pendingManualScan = false
-        lastManualScanAt = Date()
-        manualForceRetry = !badges.isEmpty
-        let detail = badges.isEmpty ? "无待处理" : "发现 \(badges.count) 条 · 立即重试"
-        log("▶ 立即扫描完成 · \(detail)")
-        note("立即扫描", "scan", detail)
-        // 手动扫描：清退避，马上再试（不要只挂在「待继续」里等分钟级冷却）
-        for b in badges {
-            quickFails[b.title] = 0
-            lastAttemptAt.removeValue(forKey: b.title)
-            lastBackoffNoteLeft.removeValue(forKey: b.title)
-            lastSendAt.removeValue(forKey: b.title)
-            lastSentKey.removeValue(forKey: b.title)
-        }
+    func note(_ title: String, _ result: String, _ detail: String = "") {
+        recentActions.append(["ts": iso.string(from: Date()), "clock": clockString(),
+                              "title": title, "result": result, "detail": detail])
+        if recentActions.count > 25 { recentActions.removeFirst(recentActions.count - 25) }
     }
-    // Also honor SCAN_NOW dropped while we were busy in this iteration.
-    if FileManager.default.fileExists(atPath: scanNowFile) {
-        try? FileManager.default.removeItem(atPath: scanNowFile)
-        pendingManualScan = true
-        log("▶ 手动立即扫描（轮询中收到）")
-    }
-    writeState(badges: badges, lastPoll: now)
-
-    for b in badges {
-        if FileManager.default.fileExists(atPath: stopFile) { break }
-        if paused { note(b.title, "paused", "监控已暂停"); continue }
-        // Same error-turn still pending after a claimed send → false success.
-        // A *new* errorTurn (typical: continue 后又 429) is fresh work — do not punish.
-        if !manualForceRetry, let sentAt = lastSendAt[b.title], now.timeIntervalSince(sentAt) > 45 {
-            let curKey: String? = {
-                guard let tid = b.threadId, let turn = b.errorTurn else { return nil }
-                return handledKey(tid, turn)
-            }()
-            let prevKey = lastSentKey[b.title]
-            lastSendAt.removeValue(forKey: b.title)
-            if let curKey, let prevKey, curKey == prevKey {
-                lastAttemptAt[b.title] = sentAt
-                quickFails[b.title] = min((quickFails[b.title] ?? 0) + 1, 4)
-                lastFailReason[b.title] = "发送后仍待处理"
-                log("· [\(b.title)] 发送后仍待处理（同一 errorTurn），作废上次成功标记")
-            } else {
-                lastSentKey.removeValue(forKey: b.title)
-                quickFails[b.title] = 0
-                lastFailReason[b.title] = b.errorMsg.map { "发送后又失败 · \(String($0.prefix(36)))" } ?? "发送后又失败"
-                log("· [\(b.title)] 发送后又新失败（新 errorTurn / 429），不退避，马上再试")
-            }
-        }
-        if !manualForceRetry, let sentAt = lastSendAt[b.title], now.timeIntervalSince(sentAt) < 40 {
-            continue
-        }
+    var isBlind = false
+    var isOffscreen = false
+    func writeState(badges: [Badge], lastPoll: Date) {
         let waits: [Double] = [0, 90, 180, 300, 600]
-        let fails = quickFails[b.title] ?? 0
-        let wait = manualForceRetry ? 0 : waits[min(fails, waits.count - 1)]
-        let sinceAttempt = now.timeIntervalSince(lastAttemptAt[b.title] ?? .distantPast)
-        if wait > 0 && sinceAttempt < wait {
-            let left = Int(ceil((wait - sinceAttempt) / 60))
-            let why = lastFailReason[b.title] ?? "上次失败"
-            if lastBackoffNoteLeft[b.title] != left {
-                lastBackoffNoteLeft[b.title] = left
-                log("⏳ [\(b.title)] 退避中：\(why) · 还差 \(left) 分钟")
-                note(b.title, "backoff", "\(why) · 还差 \(left) 分钟")
-            }
-            continue
-        }
-        if let tid = b.threadId, let th = threads.first(where: { $0.id == tid }), th.running {
-            log("⚠ [\(b.title)] rollout 仍在 running，跳过")
-            note(b.title, "skipped", "仍在运行")
-            continue
-        }
-        /// Confirm rollout after a claimed send. `punish=false` when another tier will still try.
-        func finishContinue(via: String, punish: Bool = true) -> Bool {
-            var confirmed = true
-            if let path = b.path, !path.isEmpty {
-                confirmed = waitRolloutStarted(path: path, timeout: 25)
-                if confirmed {
-                    if let tid = b.threadId, let turn = b.errorTurn {
-                        markHandled(handledKey(tid, turn))
-                    }
-                    log("✓ [\(b.title)] \(via) · rollout 已开始")
-                    note(b.title, "sent", "\(via) · rollout 确认")
-                } else {
-                    log("⚠ [\(b.title)] \(via) 但 rollout 未开始")
-                    note(b.title, "failed", "\(via) 后 rollout 未开始")
-                    if punish {
-                        lastFailReason[b.title] = "\(via) 后 rollout 未开始"
-                        quickFails[b.title] = min(fails + 1, 4)
-                    }
-                    return false
+        func nextRunInfo(title: String) -> (sec: Int, hint: String) {
+            var sec = 0
+            var hint = ""
+            if let sentAt = lastSendAt[title] {
+                let cool = 40 - lastPoll.timeIntervalSince(sentAt)
+                if cool > 0 {
+                    sec = max(sec, Int(ceil(cool)))
+                    hint = "刚发送过，冷却中"
                 }
-            } else {
-                log("✓ [\(b.title)] \(via)")
-                note(b.title, "sent", via)
             }
-            lastSendAt[b.title] = Date()
-            if let tid = b.threadId, let turn = b.errorTurn {
-                lastSentKey[b.title] = handledKey(tid, turn)
-            } else {
+            let fails = quickFails[title] ?? 0
+            if fails > 0 {
+                let wait = waits[min(fails, waits.count - 1)]
+                let since = lastPoll.timeIntervalSince(lastAttemptAt[title] ?? lastSendAt[title] ?? .distantPast)
+                let left = wait - since
+                if left > 0 {
+                    sec = max(sec, Int(ceil(left)))
+                    hint = lastFailReason[title] ?? "退避中"
+                }
+            }
+            return (sec, hint)
+        }
+        var badgeArr: [[String: Any]] = []
+        for b in badges {
+            let first = badgeFirstSeen[b.title] ?? lastPoll
+            let next = nextRunInfo(title: b.title)
+            var row: [String: Any] = ["title": b.title,
+                                      "source": b.source,
+                                      "firstSeen": iso.string(from: first),
+                                      "waitingSec": Int(lastPoll.timeIntervalSince(first)),
+                                      "nextRunSec": next.sec,
+                                      "nextRunAt": iso.string(from: lastPoll.addingTimeInterval(Double(next.sec)))]
+            if !next.hint.isEmpty { row["nextRunHint"] = next.hint }
+            if let e = b.errorMsg, !e.isEmpty { row["error"] = String(e.prefix(120)) }
+            if let id = b.threadId { row["threadId"] = id }
+            badgeArr.append(row)
+        }
+        var backoffArr: [[String: Any]] = []
+        for (t, n) in quickFails where n > 0 {
+            let since = lastPoll.timeIntervalSince(lastAttemptAt[t] ?? lastSendAt[t] ?? .distantPast)
+            let w = waits[min(n, waits.count - 1)]
+            var row: [String: Any] = ["title": t, "count": n, "remainSec": max(0, Int(w - since))]
+            if let why = lastFailReason[t], !why.isEmpty { row["reason"] = why }
+            backoffArr.append(row)
+        }
+        let elapsed = lastPoll.timeIntervalSince(startDate)
+        let permanent = settings.maxRuntimeHours <= 0
+        let limitSec = permanent ? 0.0 : settings.maxRuntimeHours * 3600
+        var remain: Any = NSNull()
+        if !permanent { remain = max(0, Int(limitSec - elapsed)) }
+        var targetObj: [String: Any] = [
+            "mode": targetMeta?.mode ?? "none",
+            "pid": Int(targetMeta?.pid ?? 0),
+            "name": targetMeta?.name ?? "",
+            "bundleId": targetMeta?.bundleId ?? settings.targetBundleId,
+            "pinnedPid": Int(settings.targetPid)
+        ]
+        if preferredWin > 0 { targetObj["windowId"] = preferredWin }
+        let obj: [String: Any] = [
+            "pid": Int(getpid()),
+            "startedAt": iso.string(from: startDate),
+            "heartbeat": iso.string(from: lastPoll),
+            "pollSec": settings.pollSec,
+            "discoverMode": settings.discoverMode,
+            "paused": FileManager.default.fileExists(atPath: pauseFile),
+            "blind": isBlind,
+            "offscreen": isOffscreen,
+            "ax": axBridge.trusted,
+            "permanent": permanent,
+            "maxRuntimeHours": settings.maxRuntimeHours,
+            "remainSec": remain,
+            "target": targetObj,
+            "badges": badgeArr,
+            "actions": recentActions,
+            "backoff": backoffArr,
+            "manualScanAt": lastManualScanAt.map { iso.string(from: $0) } as Any? ?? NSNull(),
+            "version": 1
+        ]
+        if let d = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted]) {
+            try? d.write(to: URL(fileURLWithPath: stateFile))
+        }
+    }
+
+    // 立刻写心跳，避免首轮扫描时菜单栏仍显示「监控未运行」
+    writeState(badges: [], lastPoll: startDate)
+
+    while true {
+        axBridge.refreshTrust()
+        settings = loadSettings()
+        if settings.maxRuntimeHours > 0 {
+            let limit = settings.maxRuntimeHours * 3600
+            let elapsed = Date().timeIntervalSince(startDate)
+            if elapsed >= limit {
+                log("达到设定最长运行时间 \(settings.maxRuntimeHours) 小时，退出")
+                break
+            }
+        }
+        if FileManager.default.fileExists(atPath: stopFile) { log("检测到 STOP，退出"); break }
+        let now = Date()
+        let paused = FileManager.default.fileExists(atPath: pauseFile)
+        writeState(badges: lastBadges, lastPoll: now)
+        let t0 = Date()
+        // PID first, then windows owned by that PID (works off-Space via CGWindowList + screencapture -l).
+        guard let target = resolveTargetPid(settings) else {
+            targetMeta = nil
+            isOffscreen = false
+            if Int(now.timeIntervalSince1970) % 30 < Int(settings.pollSec) {
+                log("⚠ 找不到监控目标（targetPid / \(settings.targetBundleId)）")
+            }
+            waitPoll(settings.pollSec); continue
+        }
+        if targetMeta?.pid != target.pid {
+            preferredWin = -1
+            log("ℹ 监控目标 \(target.name) pid=\(target.pid) mode=\(target.mode) bundle=\(target.bundleId)")
+        }
+        targetMeta = target
+        let pid = target.pid
+        let appName = target.name.isEmpty ? "ChatGPT" : target.name
+        let mode = "files"
+        let handled = loadHandled()
+        let threads = scanThreads()
+        let badges = fileWorkItems(threads, handled: handled)
+        isBlind = false
+        // 仅在有待办时解析窗口几何（发送要用）
+        if !badges.isEmpty, let (wid, _, on0) = windowInfo(pid) {
+            preferredWin = wid
+            let wasOff = isOffscreen
+            isOffscreen = !on0
+            if isOffscreen && !wasOff { log("ℹ \(target.name) 不在当前屏(其他 Space/被切走)，仍可后台操作") }
+            if !isOffscreen && wasOff { log("ℹ \(target.name) 已回到当前屏") }
+        } else if badges.isEmpty {
+            isOffscreen = false
+        }
+
+        let pollMs = Int(Date().timeIntervalSince(t0) * 1000)
+        if pollMs > 1500 { log("⏱ 本轮检测 \(pollMs)ms mode=\(mode)") }
+        lastBadges = badges
+        let titles = Set(badges.map { $0.title })
+        for t in titles where badgeFirstSeen[t] == nil { badgeFirstSeen[t] = now }
+        for t in Array(badgeFirstSeen.keys) where !titles.contains(t) { badgeFirstSeen.removeValue(forKey: t) }
+        let sig = badges.map { "\($0.title)[\($0.source)]" }.joined(separator: " | ")
+        if sig != lastBadgeTitles {
+            log("待处理 \(badges.count) 个: \(sig.isEmpty ? "(无)" : sig)")
+            lastBadgeTitles = sig
+        }
+        var manualForceRetry = false
+        if pendingManualScan {
+            pendingManualScan = false
+            lastManualScanAt = Date()
+            manualForceRetry = !badges.isEmpty
+            let detail = badges.isEmpty ? "无待处理" : "发现 \(badges.count) 条 · 立即重试"
+            log("▶ 立即扫描完成 · \(detail)")
+            note("立即扫描", "scan", detail)
+            // 手动扫描：清退避，马上再试（不要只挂在「待继续」里等分钟级冷却）
+            for b in badges {
+                quickFails[b.title] = 0
+                lastAttemptAt.removeValue(forKey: b.title)
+                lastBackoffNoteLeft.removeValue(forKey: b.title)
+                lastSendAt.removeValue(forKey: b.title)
                 lastSentKey.removeValue(forKey: b.title)
             }
-            lastFailReason.removeValue(forKey: b.title)
-            quickFails[b.title] = 0
-            return true
         }
-
-        let whyErr = b.errorMsg.map { String($0.prefix(40)) } ?? ""
-        lastAttemptAt[b.title] = Date()
-        var done = false
-
-        // ---- Tier A: codex queue first（不依赖窗口 / Space）----
-        if settings.useCodexQueue, let tid = b.threadId, !tid.isEmpty {
-            log("继续 [\(b.title)] source=\(b.source)\(whyErr.isEmpty ? "" : " ← \(whyErr)") → codex queue 优先")
-            if let qerr = queueContinue(threadId: tid) {
-                log("⚠ [\(b.title)] codex queue 失败：\(qerr) → 抢焦点兜底")
-                note(b.title, "failed", "codex queue：\(qerr)")
-            } else if finishContinue(via: "codex queue", punish: false) {
-                done = true
-            } else {
-                log("⚠ [\(b.title)] codex queue 后 rollout 未开始 → 抢焦点兜底")
-            }
+        // Also honor SCAN_NOW dropped while we were busy in this iteration.
+        if FileManager.default.fileExists(atPath: scanNowFile) {
+            try? FileManager.default.removeItem(atPath: scanNowFile)
+            pendingManualScan = true
+            log("▶ 手动立即扫描（轮询中收到）")
         }
+        writeState(badges: badges, lastPoll: now)
 
-        // ---- Tier B: 卡住时短暂抢焦点，再 AX / agent-desktop（无盲发）----
-        if !done {
-            let axReady = composerAXReady(pid: pid, appName: appName)
-            if isOffscreen || !axReady {
-                log("继续 [\(b.title)] → 抢焦点兜底发送（offscreen=\(isOffscreen) ax=\(axReady)）")
-                _ = stealFocusBriefly(pid: pid, appName: appName)
-            } else {
-                log("继续 [\(b.title)] → UI 兜底发送（当前屏）")
+        for b in badges {
+            if FileManager.default.fileExists(atPath: stopFile) { break }
+            if paused { note(b.title, "paused", "监控已暂停"); continue }
+            // Same error-turn still pending after a claimed send → false success.
+            // A *new* errorTurn (typical: continue 后又 429) is fresh work — do not punish.
+            if !manualForceRetry, let sentAt = lastSendAt[b.title], now.timeIntervalSince(sentAt) > 45 {
+                let curKey: String? = {
+                    guard let tid = b.threadId, let turn = b.errorTurn else { return nil }
+                    return handledKey(tid, turn)
+                }()
+                let prevKey = lastSentKey[b.title]
+                lastSendAt.removeValue(forKey: b.title)
+                if let curKey, let prevKey, curKey == prevKey {
+                    lastAttemptAt[b.title] = sentAt
+                    quickFails[b.title] = min((quickFails[b.title] ?? 0) + 1, 4)
+                    lastFailReason[b.title] = "发送后仍待处理"
+                    log("· [\(b.title)] 发送后仍待处理（同一 errorTurn），作废上次成功标记")
+                } else {
+                    lastSentKey.removeValue(forKey: b.title)
+                    quickFails[b.title] = 0
+                    lastFailReason[b.title] = b.errorMsg.map { "发送后又失败 · \(String($0.prefix(36)))" } ?? "发送后又失败"
+                    log("· [\(b.title)] 发送后又新失败（新 errorTurn / 429），不退避，马上再试")
+                }
             }
-            let open = ensureOpen(b.title, pid: pid, appName: appName)
-            guard let (wid, win, _) = open.ok else {
-                let why = open.fail ?? "打不开会话"
-                log("✗ [\(b.title)] 抢焦点后仍：\(why)")
-                note(b.title, "failed", "抢焦点·\(why)")
-                lastFailReason[b.title] = "抢焦点·\(why)"
-                quickFails[b.title] = min(fails + 1, 4)
-                writeState(badges: badges, lastPoll: Date())
-                Thread.sleep(forTimeInterval: 2)
+            if !manualForceRetry, let sentAt = lastSendAt[b.title], now.timeIntervalSince(sentAt) < 40 {
                 continue
             }
-            let send = sendContinue(win: win, wid: wid, name: b.title, pid: pid)
-            if let reason = send.error {
-                log("✗ [\(b.title)] 抢焦点发送失败：\(reason)")
-                note(b.title, "failed", "抢焦点·\(reason)")
-                lastFailReason[b.title] = "抢焦点·\(reason)"
-                quickFails[b.title] = min(fails + 1, 4)
-            } else {
-                let method = "抢焦点·\(send.method ?? "UI")"
-                _ = finishContinue(via: method)
+            let waits: [Double] = [0, 90, 180, 300, 600]
+            let fails = quickFails[b.title] ?? 0
+            let wait = manualForceRetry ? 0 : waits[min(fails, waits.count - 1)]
+            let sinceAttempt = now.timeIntervalSince(lastAttemptAt[b.title] ?? .distantPast)
+            if wait > 0 && sinceAttempt < wait {
+                let left = Int(ceil((wait - sinceAttempt) / 60))
+                let why = lastFailReason[b.title] ?? "上次失败"
+                if lastBackoffNoteLeft[b.title] != left {
+                    lastBackoffNoteLeft[b.title] = left
+                    log("⏳ [\(b.title)] 退避中：\(why) · 还差 \(left) 分钟")
+                    note(b.title, "backoff", "\(why) · 还差 \(left) 分钟")
+                }
+                continue
             }
+            if let tid = b.threadId, let th = threads.first(where: { $0.id == tid }), th.running {
+                log("⚠ [\(b.title)] rollout 仍在 running，跳过")
+                note(b.title, "skipped", "仍在运行")
+                continue
+            }
+            /// Confirm rollout after a claimed send. `punish=false` when another tier will still try.
+            func finishContinue(via: String, punish: Bool = true) -> Bool {
+                var confirmed = true
+                if let path = b.path, !path.isEmpty {
+                    confirmed = waitRolloutStarted(path: path, timeout: 25)
+                    if confirmed {
+                        if let tid = b.threadId, let turn = b.errorTurn {
+                            markHandled(handledKey(tid, turn))
+                        }
+                        log("✓ [\(b.title)] \(via) · rollout 已开始")
+                        note(b.title, "sent", "\(via) · rollout 确认")
+                    } else {
+                        log("⚠ [\(b.title)] \(via) 但 rollout 未开始")
+                        note(b.title, "failed", "\(via) 后 rollout 未开始")
+                        if punish {
+                            lastFailReason[b.title] = "\(via) 后 rollout 未开始"
+                            quickFails[b.title] = min(fails + 1, 4)
+                        }
+                        return false
+                    }
+                } else {
+                    log("✓ [\(b.title)] \(via)")
+                    note(b.title, "sent", via)
+                }
+                lastSendAt[b.title] = Date()
+                if let tid = b.threadId, let turn = b.errorTurn {
+                    lastSentKey[b.title] = handledKey(tid, turn)
+                } else {
+                    lastSentKey.removeValue(forKey: b.title)
+                }
+                lastFailReason.removeValue(forKey: b.title)
+                quickFails[b.title] = 0
+                return true
+            }
+
+            let whyErr = b.errorMsg.map { String($0.prefix(40)) } ?? ""
+            lastAttemptAt[b.title] = Date()
+            var done = false
+
+            // ---- Tier A: codex queue first（不依赖窗口 / Space）----
+            if settings.useCodexQueue, let tid = b.threadId, !tid.isEmpty {
+                log("继续 [\(b.title)] source=\(b.source)\(whyErr.isEmpty ? "" : " ← \(whyErr)") → codex queue 优先")
+                if let qerr = queueContinue(threadId: tid) {
+                    log("⚠ [\(b.title)] codex queue 失败：\(qerr) → 抢焦点兜底")
+                    note(b.title, "failed", "codex queue：\(qerr)")
+                } else if finishContinue(via: "codex queue", punish: false) {
+                    done = true
+                } else {
+                    log("⚠ [\(b.title)] codex queue 后 rollout 未开始 → 抢焦点兜底")
+                }
+            }
+
+            // ---- Tier B: 卡住时短暂抢焦点，再 AX / agent-desktop（无盲发）----
+            if !done {
+                let axReady = composerAXReady(pid: pid, appName: appName)
+                if isOffscreen || !axReady {
+                    log("继续 [\(b.title)] → 抢焦点兜底发送（offscreen=\(isOffscreen) ax=\(axReady)）")
+                    _ = stealFocusBriefly(pid: pid, appName: appName)
+                } else {
+                    log("继续 [\(b.title)] → UI 兜底发送（当前屏）")
+                }
+                let open = ensureOpen(b.title, pid: pid, appName: appName)
+                guard let (wid, win, _) = open.ok else {
+                    let why = open.fail ?? "打不开会话"
+                    log("✗ [\(b.title)] 抢焦点后仍：\(why)")
+                    note(b.title, "failed", "抢焦点·\(why)")
+                    lastFailReason[b.title] = "抢焦点·\(why)"
+                    quickFails[b.title] = min(fails + 1, 4)
+                    writeState(badges: badges, lastPoll: Date())
+                    Thread.sleep(forTimeInterval: 2)
+                    continue
+                }
+                let send = sendContinue(win: win, wid: wid, name: b.title, pid: pid)
+                if let reason = send.error {
+                    log("✗ [\(b.title)] 抢焦点发送失败：\(reason)")
+                    note(b.title, "failed", "抢焦点·\(reason)")
+                    lastFailReason[b.title] = "抢焦点·\(reason)"
+                    quickFails[b.title] = min(fails + 1, 4)
+                } else {
+                    let method = "抢焦点·\(send.method ?? "UI")"
+                    _ = finishContinue(via: method)
+                }
+            }
+            writeState(badges: badges, lastPoll: Date())
+            Thread.sleep(forTimeInterval: 2)
         }
-        writeState(badges: badges, lastPoll: Date())
-        Thread.sleep(forTimeInterval: 2)
+        waitPoll(settings.pollSec)
     }
-    waitPoll(settings.pollSec)
+    log("=== 监控结束(运行 \(Int(Date().timeIntervalSince(startDate)/60)) 分钟) ===")
+    writeState(badges: [], lastPoll: Date())
+
 }
-log("=== 监控结束(运行 \(Int(Date().timeIntervalSince(startDate)/60)) 分钟) ===")
-writeState(badges: [], lastPoll: Date())
+
+let _watchExeName = URL(fileURLWithPath: CommandLine.arguments[0]).lastPathComponent
+if _watchExeName == AppPaths.daemonBinaryName || CommandLine.arguments.contains("--daemon") {
+    runWatchDaemon()
+}

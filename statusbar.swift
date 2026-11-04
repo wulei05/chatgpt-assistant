@@ -6,7 +6,7 @@ let settingsPath = AppPaths.settingsPath
 let pausePath = AppPaths.pausePath
 let stopPath = AppPaths.stopPath
 let scanNowPath = AppPaths.scanNowPath
-let logPath = AppPaths.logPath
+// `logPath` is declared in watch3.swift (CGPTBar links both).
 
 func readJSON(_ path: String) -> [String: Any]? {
     guard let d = try? Data(contentsOf: URL(fileURLWithPath: path)),
@@ -356,7 +356,8 @@ final class Controller: NSObject, NSMenuDelegate {
             meta("   ⚠ 窗口在其他 Space", color: .systemOrange)
         }
         if (s.state?["ax"] as? Bool) == false {
-            meta("   ⚠ 未开辅助功能", color: .systemYellow)
+            meta("   ⚠ 未开辅助功能（系统设置 → 隐私与安全性 → 辅助功能）", color: .systemYellow)
+            meta("   请勾选 ChatGPT助手；改完后点「开启监控」或重启 App", color: .systemYellow)
         }
 
         // Width: idle comfortable, pending a bit wider (scan-row view is the width rail).
@@ -604,7 +605,7 @@ final class Controller: NSObject, NSMenuDelegate {
         reveal.target = self
         menu.addItem(reveal)
 
-        let quit = NSMenuItem(title: "退出菜单栏", action: #selector(quit), keyEquivalent: "q")
+        let quit = NSMenuItem(title: "退出应用", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
     }
@@ -697,7 +698,11 @@ final class Controller: NSObject, NSMenuDelegate {
     @objc func openSpec() {
         NSWorkspace.shared.open(URL(fileURLWithPath: AppPaths.specPath))
     }
-    @objc func quit() { NSApp.terminate(nil) }
+    @objc func quit() {
+        // 退出菜单栏时一并停掉守护进程，否则 .app 会被占用无法覆盖安装
+        AppPaths.stopDaemon()
+        NSApp.terminate(nil)
+    }
 }
 
 let app = NSApplication.shared
