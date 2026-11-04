@@ -14,6 +14,8 @@ macOS **菜单栏 App**：根据本地 Codex **运行记录（rollout）** 发�
 
 运行数据：`~/Library/Application Support/ChatGPT助手/`
 
+应用图标源文件在 `assets/AppIcon.icns`（青绿对话泡 + 珊瑚色继续按钮）。
+
 ## 本地构建
 
 ```bash

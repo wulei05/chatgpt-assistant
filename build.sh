@@ -36,6 +36,9 @@ package_app() {
   cp Info.plist "$APP/Contents/Info.plist"
   echo -n 'APPL????' > "$APP/Contents/PkgInfo"
   cp settings.json SPEC.md "$APP/Contents/Resources/"
+  if [[ -f "$ROOT/assets/AppIcon.icns" ]]; then
+    cp "$ROOT/assets/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+  fi
   for bin in cli key; do
     if [[ -f "$ROOT/$bin" ]]; then
       cp "$ROOT/$bin" "$APP/Contents/MacOS/"
