@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 /// Shared layout for ChatGPT助手:
@@ -43,6 +44,26 @@ enum AppPaths {
     static var resourcesDir: String { resolved.resources }
     static var macOSDir: String { resolved.macOS }
     static var runningInAppBundle: Bool { resolved.inApp }
+
+    /// macOS 27+ renames Privacy → Accessibility UI to「设备控制和数据访问」.
+    static var isMacOS27OrNewer: Bool {
+        ProcessInfo.processInfo.isOperatingSystemAtLeast(
+            OperatingSystemVersion(majorVersion: 27, minorVersion: 0, patchVersion: 0)
+        )
+    }
+
+    /// User-visible name of the TCC pane that gates AXIsProcessTrusted.
+    static var accessibilityPrivacyName: String {
+        isMacOS27OrNewer ? "设备控制和数据访问" : "辅助功能"
+    }
+
+    static var accessibilitySettingsURL: URL {
+        URL(string: "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility")!
+    }
+
+    static func openAccessibilitySettings() {
+        NSWorkspace.shared.open(accessibilitySettingsURL)
+    }
 
     static var statePath: String { dataDir + "/state.json" }
     static var settingsPath: String { dataDir + "/settings.json" }

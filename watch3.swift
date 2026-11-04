@@ -1029,7 +1029,7 @@ func sendContinue(win: CGRect, wid: Int, name: String, pid: pid_t) -> (method: S
             log("  · AX 输入框未找到/SetValue 失败，降级")
         }
     } else {
-        log("  · 无辅助功能权限，跳过 AX（系统设置里给 watch3 开 Accessibility）")
+        log("  · 无\(AppPaths.accessibilityPrivacyName)权限，跳过 AX")
     }
 
     func tryInject(attempts: Int) -> String? {
@@ -1464,7 +1464,7 @@ func runWatchDaemon() {
     }()
     log("=== ChatGPT助手 启动 pid=\(ProcessInfo.processInfo.processIdentifier) AX=\(axBridge.trusted ? "on" : "off") 最长=\(runtimeDesc) 轮询=\(Int(settings.pollSec))s \(targetHint) agent-desktop=\(settings.useAgentDesktop ? "on" : "off") codex-queue=\(settings.useCodexQueue ? "on" : "off") ===")
     if !axBridge.trusted {
-        log("⚠ 未授予辅助功能权限：系统设置 → 隐私与安全性 → 辅助功能 → 勾选 ChatGPT助手（AX 路径需要；与「设备控制」不是同一项）")
+        log("⚠ 未授予「\(AppPaths.accessibilityPrivacyName)」：系统设置 → 隐私与安全性 → \(AppPaths.accessibilityPrivacyName) → 勾选 ChatGPT助手")
     }
     var lastBadgeTitles = ""
     var lastBadges: [Badge] = []

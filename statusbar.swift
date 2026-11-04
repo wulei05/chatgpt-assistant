@@ -356,9 +356,13 @@ final class Controller: NSObject, NSMenuDelegate {
             meta("   ⚠ 窗口在其他 Space", color: .systemOrange)
         }
         if (s.state?["ax"] as? Bool) == false {
-            meta("   ⚠ 未开「辅助功能」（不是「设备控制/数据访问」）", color: .systemYellow)
-            meta("   系统设置 → 隐私与安全性 → 辅助功能 → 勾选 ChatGPT助手", color: .systemYellow)
-            meta("   改完后退出应用再打开", color: .systemYellow)
+            let pane = AppPaths.accessibilityPrivacyName
+            meta("   ⚠ 未开「\(pane)」", color: .systemYellow)
+            meta("   系统设置 → 隐私与安全性 → \(pane) → 勾选 ChatGPT助手", color: .systemYellow)
+            meta("   改完后退出应用再打开（macOS 27+ 已无「辅助功能」入口）", color: .systemYellow)
+            let openAx = NSMenuItem(title: "打开「\(pane)」设置…", action: #selector(openAccessibilityPrivacy), keyEquivalent: "")
+            openAx.target = self
+            menu.addItem(openAx)
         }
 
         // Width: idle comfortable, pending a bit wider (scan-row view is the width rail).
@@ -698,6 +702,9 @@ final class Controller: NSObject, NSMenuDelegate {
     }
     @objc func openSpec() {
         NSWorkspace.shared.open(URL(fileURLWithPath: AppPaths.specPath))
+    }
+    @objc func openAccessibilityPrivacy() {
+        AppPaths.openAccessibilitySettings()
     }
     @objc func quit() {
         // 退出菜单栏时一并停掉守护进程，否则 .app 会被占用无法覆盖安装
