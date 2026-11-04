@@ -31,3 +31,7 @@ wstate.swift
 # macOS
 .DS_Store
 *.dSYM/
+
+# Release packages
+*.zip
+*.sha256
