@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 import Foundation
 
 let statePath = AppPaths.statePath
@@ -168,7 +169,9 @@ final class Controller: NSObject, NSMenuDelegate {
         let act = (s.actions.last?["ts"] as? String) ?? ""
         let actRes = (s.actions.last?["result"] as? String) ?? ""
         let next = s.badges.map { "\(badgeNextRunSec($0))" }.joined(separator: ",")
-        return "\(s.alive)-\(Int(s.heartbeatAge))-\(s.badges.count)-\(ms)-\(pending)-\(act)-\(actRes)-\(s.paused)-\(next)"
+        // Live AX — same process as in-app watch; include so open menu drops the yellow banner when TCC catches up.
+        let ax = AXIsProcessTrusted() ? "1" : "0"
+        return "\(s.alive)-\(Int(s.heartbeatAge))-\(s.badges.count)-\(ms)-\(pending)-\(act)-\(actRes)-\(s.paused)-\(next)-\(ax)"
     }
 
     /// Custom view button — clicking does not dismiss the status menu. Shows ⌘R affordance.
@@ -355,11 +358,17 @@ final class Controller: NSObject, NSMenuDelegate {
         if (s.state?["offscreen"] as? Bool) == true {
             meta("   ⚠ 窗口在其他 Space", color: .systemOrange)
         }
-        if (s.state?["ax"] as? Bool) == false {
+        // Prefer live API (in-app daemon shares this process). state.json can lag right after launch.
+        let axLive = AXIsProcessTrusted()
+        let axState = s.state?["ax"] as? Bool
+        if !axLive {
             let pane = AppPaths.accessibilityPrivacyName
-            meta("   ⚠ 系统判定未授权「\(pane)」", color: .systemYellow)
-            meta("   设置里开关开了也可能仍如此（macOS 27 常见）", color: .systemYellow)
-            meta("   处理：列表中删除 ChatGPT助手 → 再添加 → 退出应用重开", color: .systemYellow)
+            meta("   ⚠ 系统 API 仍返回未授权「\(pane)」", color: .systemYellow)
+            meta("   设置里开关开着也会这样：授权按代码签名绑定，更新 App 后常失效", color: .systemYellow)
+            meta("   处理：列表删除 → 再添加 → ⌘Q 完全退出 → 再打开", color: .systemYellow)
+            if axState == true {
+                meta("   （状态文件已标已授权，以系统 API 为准）", color: .systemYellow)
+            }
             let openAx = NSMenuItem(title: "打开「\(pane)」设置…", action: #selector(openAccessibilityPrivacy), keyEquivalent: "")
             openAx.target = self
             menu.addItem(openAx)

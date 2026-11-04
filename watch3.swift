@@ -451,8 +451,9 @@ final class AxBridge {
     private(set) var trusted: Bool
     private var lastPromptAt: Date = .distantPast
     init() {
-        trusted = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
-        lastPromptAt = Date()
+        // No prompt on init — LaunchServices + ad-hoc TCC often returns false for the first
+        // few hundred ms even when Settings already shows ON. Prompting here races and sticks.
+        trusted = AXIsProcessTrusted()
     }
     func refreshTrust(promptIfNeeded: Bool = false) {
         if promptIfNeeded, !AXIsProcessTrusted(), Date().timeIntervalSince(lastPromptAt) > 45 {
@@ -460,6 +461,14 @@ final class AxBridge {
             lastPromptAt = Date()
         } else {
             trusted = AXIsProcessTrusted()
+        }
+    }
+    /// Retry briefly so a Settings-ON grant that hasn't attached yet is not reported as off.
+    func settleTrust(attempts: Int = 6, interval: TimeInterval = 0.35) {
+        for i in 0..<attempts {
+            refreshTrust(promptIfNeeded: i == attempts - 1)
+            if trusted { return }
+            Thread.sleep(forTimeInterval: interval)
         }
     }
     private func str(_ el: AXUIElement, _ name: String) -> String? {
@@ -600,7 +609,7 @@ final class AxBridge {
         if press(el) { return true }
         return setFocused(el)
     }
-    /// Set composer text via AX when possible. Returns true if AXValue contains continue afterwards.
+    /// Set composer to continue via AX. Trusts AXSetValue success even when readback is empty/stale.
     func typeContinue(pid: pid_t) -> Bool {
         guard let box = findComposer(pid: pid) else { return false }
         if let cur = getValue(box), textLooksLikeContinue(cur) {
@@ -610,15 +619,15 @@ final class AxBridge {
         _ = setFocused(box)
         _ = setValue(box, "")
         Thread.sleep(forTimeInterval: 0.05)
-        if setValue(box, "continue") {
-            let got = getValue(box) ?? ""
-            if textLooksLikeContinue(got) {
-                log("  · AXSetValue continue 确认")
-                return true
-            }
-            log("  · AXSetValue 返回成功但读回为空「\(got.prefix(24))」")
+        guard setValue(box, "continue") else { return false }
+        let got = getValue(box) ?? ""
+        if textLooksLikeContinue(got) {
+            log("  · AXSetValue continue 确认")
+        } else {
+            // Readback often lags or stays empty; do not treat as failure (that caused re-paste loops).
+            log("  · AXSetValue 已写入（读回「\(got.prefix(24))」，按成功处理）")
         }
-        return false
+        return true
     }
     func pressSendLike(pid: pid_t) -> Bool {
         // Do NOT match generic 「提交」— Codex UI has unrelated buttons like 「提交信息」.
@@ -946,13 +955,20 @@ func findSendButtonLocal(_ img: CGImage, win: CGRect) -> (CGFloat, CGFloat)? {
     return (lx, ly)
 }
 
-/// CUA tiers: AX → PostToPid. Never activate / switch Space / steal cursor.
-/// On success `method` is a short tag for 最近动作（agent-desktop / AX / 盲发 …）.
+/// True when the failure is server-side capacity — UI continue cannot help and only stacks text.
+func isServerBusyError(_ msg: String) -> Bool {
+    let low = msg.lowercased()
+    return low.contains("429") || low.contains("503") || low.contains("rate limit")
+        || low.contains("too many") || low.contains("overloaded") || low.contains("capacity")
+}
+
+/// CUA tiers: write continue at most once → submit. Never activate / switch Space here.
+/// On success `method` is a short tag for 最近动作（agent-desktop / AX / PostToPid …）.
 func sendContinue(win: CGRect, wid: Int, name: String, pid: pid_t) -> (method: String?, error: String?) {
     guard let (fwid, freshWin, onscreen) = windowInfo(pid) else {
         log("  ✗ 找不到窗口，放弃 [\(name)]"); return (nil, "找不到窗口")
     }
-    var win = freshWin
+    let win = freshWin
     if !onscreen {
         log("  · 窗口在外屏/其他 Space，后台发送（不切回）")
     }
@@ -978,22 +994,32 @@ func sendContinue(win: CGRect, wid: Int, name: String, pid: pid_t) -> (method: S
         Thread.sleep(forTimeInterval: 0.1)
         _ = pidInput.click(pid: pid, wid: fwid, win: win, localX: sendX, localY: sendY)
     }
+    /// Returns true if composer cleared, or if we cannot read it (rollout confirms later).
     func submitBackground(tag: String) -> Bool {
         clickSubmitOnce()
+        var sawReadable = false
         for _ in 1...8 {
             Thread.sleep(forTimeInterval: 0.4)
-            let img = capture(capWid)
-            if composerLooksClearedNow(pid: pid, img: img, appName: appName) {
-                log("  ✓ 已提交(\(tag)·后台)")
-                return true
+            if let t = readComposerText(pid: pid, appName: appName) {
+                sawReadable = true
+                if composerSendableText(t) == nil {
+                    log("  ✓ 已提交(\(tag)·后台)")
+                    return true
+                }
             }
+        }
+        if !sawReadable {
+            // Unreadable after click — do not loop paste; let finishContinue wait on rollout.
+            log("  · 提交后无法读回输入框（\(tag)），交由 rollout 确认")
+            return true
         }
         return false
     }
-    // Already has continue (possibly stacked from earlier false-negatives) → just submit.
-    if composerHasContinueNow(pid: pid, img: capture(capWid), appName: appName) {
+
+    // Already has continue → submit only (never write again).
+    if composerHasContinueNow(pid: pid, appName: appName) {
         let cur = readComposerText(pid: pid, appName: appName) ?? ""
-        log("  · 输入框已有 continue（AX/agent-desktop），直接提交: \(cur.prefix(40))")
+        log("  · 输入框已有 continue，直接提交: \(cur.prefix(40))")
         for attempt in 1...3 {
             if submitBackground(tag: "已有·第\(attempt)轮") { return ("已有continue", nil) }
         }
@@ -1001,7 +1027,7 @@ func sendContinue(win: CGRect, wid: Int, name: String, pid: pid_t) -> (method: S
     }
 
     // Draft already in the box → send it as-is (do not overwrite with continue).
-    if let raw = readComposerText(pid: pid, img: capture(capWid), appName: appName),
+    if let raw = readComposerText(pid: pid, appName: appName),
        let draft = composerSendableText(raw),
        !textLooksLikeContinue(raw) {
         log("  · 输入框已有草稿，直接发送: \(draft.prefix(28))")
@@ -1012,75 +1038,66 @@ func sendContinue(win: CGRect, wid: Int, name: String, pid: pid_t) -> (method: S
         return (nil, "草稿提交失败")
     }
 
-    // ---- Tier 0: agent-desktop set-value (read-back via AX value, no OCR) ----
+    // ---- Write continue at most once (AD → AX → PostToPid replace) ----
+    var method: String?
+    var wrote = false
+
     if settings.useAgentDesktop, !agentDesktopDisabled {
         log("  · CUA Tier0 agent-desktop set-value")
         if agentDesktopSetComposer("continue", bin: settings.agentDesktopPath, appName: appName, pid: pid) {
-            if composerHasContinueNow(pid: pid, appName: appName) {
-                if submitBackground(tag: "AD") { return ("agent-desktop", nil) }
-            }
+            wrote = true
+            method = "agent-desktop"
         }
     }
 
-    // ---- Tier 1: AX set value (works off-Space; no focus needed) ----
-    if axBridge.trusted {
-        log("  · CUA Tier1 AX 输入")
-        if axBridge.typeContinue(pid: pid) {
-            Thread.sleep(forTimeInterval: 0.25)
-            if composerHasContinueNow(pid: pid, img: capture(capWid), appName: appName) {
-                if submitBackground(tag: "AX") { return ("AX", nil) }
+    if !wrote {
+        if axBridge.trusted {
+            log("  · CUA Tier1 AX 输入")
+            if axBridge.typeContinue(pid: pid) {
+                wrote = true
+                method = "AX"
             } else {
-                log("  · AX 写入后读回仍无 continue，降级")
+                log("  · AX 输入框未找到/SetValue 失败，降级")
             }
         } else {
-            log("  · AX 输入框未找到/SetValue 失败，降级")
+            log("  · 无\(AppPaths.accessibilityPrivacyName)权限，跳过 AX")
+        }
+    }
+
+    if !wrote {
+        // One replace inject: Cmd+A then type — never append in a retry loop.
+        log("  · CUA Tier2 PostToPid 输入一次（Cmd+A 覆盖）")
+        _ = pidInput.click(pid: pid, wid: fwid, win: win, localX: lx, localY: ly)
+        Thread.sleep(forTimeInterval: 0.2)
+        pidInput.chord(key: 0, modifiers: [(55, .maskCommand)], pid: pid) // Cmd+A
+        Thread.sleep(forTimeInterval: 0.05)
+        pasteText("continue", pid: pid)
+        Thread.sleep(forTimeInterval: 0.35)
+        wrote = true
+        method = "PostToPid"
+    }
+
+    Thread.sleep(forTimeInterval: 0.25)
+    if let t = readComposerText(pid: pid, appName: appName) {
+        if textLooksLikeContinue(t) {
+            log("  · 写入后读回确认: \(t.prefix(40))")
+        } else if composerSendableText(t) != nil {
+            log("  · 写入后读回非 continue「\(t.prefix(40))」，仍尝试提交")
         }
     } else {
-        log("  · 无\(AppPaths.accessibilityPrivacyName)权限，跳过 AX")
-    }
-
-    func tryInject(attempts: Int) -> String? {
-        log("  · CUA Tier2/3 PostToPid")
-        if composerHasContinueNow(pid: pid, img: capture(capWid), appName: appName) {
-            log("  · 输入框已有 continue，直接提交")
-            return nil
-        }
-        if let raw = readComposerText(pid: pid, img: capture(capWid), appName: appName),
-           let draft = composerSendableText(raw), !textLooksLikeContinue(raw) {
-            log("  · 输入框已有草稿，改为直接发送: \(draft.prefix(28))")
-            return nil
-        }
-        for t in 1...attempts {
-            if t > 1 { Thread.sleep(forTimeInterval: 0.35) }
-            _ = pidInput.click(pid: pid, wid: fwid, win: win, localX: lx, localY: ly)
-            Thread.sleep(forTimeInterval: 0.2)
-            if composerHasContinueNow(pid: pid, img: capture(capWid), appName: appName) { return nil }
-            if let raw = readComposerText(pid: pid, appName: appName),
-               let draft = composerSendableText(raw), !textLooksLikeContinue(raw) {
-                log("  · 输入框已有草稿，改为直接发送: \(draft.prefix(28))")
-                return nil
-            }
-            pasteText("continue", pid: pid)
-            Thread.sleep(forTimeInterval: 0.45)
-            if composerHasContinueNow(pid: pid, img: capture(capWid), appName: appName) { return nil }
-            let got = readComposerText(pid: pid, appName: appName) ?? "(读不到)"
-            log("  … 第 \(t) 次输入未生效（读回: \(got.prefix(32))）")
-        }
-        return "输入框未吃进文字"
-    }
-
-    // ---- Tier 2/3: PostToPid only (no HID / no activate). No blind send. ----
-    if let err = tryInject(attempts: 3) {
-        return (nil, err)
+        log("  · 写入后读不到输入框，仍尝试提交（不重写）")
     }
 
     for attempt in 1...3 {
-        if submitBackground(tag: "第\(attempt)轮") {
-            return ("PostToPid", nil)
+        if submitBackground(tag: "\(method ?? "UI")·第\(attempt)轮") {
+            return (method, nil)
         }
         log("  … 第 \(attempt) 轮未提交")
     }
-    return (nil, "已输入但提交失败")
+    if let t = readComposerText(pid: pid, appName: appName), textLooksLikeContinue(t) {
+        return (nil, "已输入但提交失败")
+    }
+    return (nil, "已写入但提交失败")
 }
 
 /// Last-resort: bring ChatGPT to current Space / front so AX & agent-desktop work.
@@ -1460,7 +1477,7 @@ func runWatchDaemon() {
     NSApp.setActivationPolicy(.accessory)
     try? FileManager.default.removeItem(atPath: stopFile)
     try? FileManager.default.removeItem(atPath: scanNowFile)
-    axBridge.refreshTrust()
+    axBridge.settleTrust()
     settings = loadSettings()
     let startDate = Date()
     let iso = ISO8601DateFormatter()
@@ -1471,7 +1488,7 @@ func runWatchDaemon() {
     }()
     log("=== ChatGPT助手 启动 pid=\(ProcessInfo.processInfo.processIdentifier) AX=\(axBridge.trusted ? "on" : "off") 最长=\(runtimeDesc) 轮询=\(Int(settings.pollSec))s \(targetHint) agent-desktop=\(settings.useAgentDesktop ? "on" : "off") codex-queue=\(settings.useCodexQueue ? "on" : "off") ===")
     if !axBridge.trusted {
-        log("⚠ 未授予「\(AppPaths.accessibilityPrivacyName)」：系统设置 → 隐私与安全性 → \(AppPaths.accessibilityPrivacyName) → 勾选 ChatGPT助手")
+        log("⚠ 系统 API 仍返回未授权「\(AppPaths.accessibilityPrivacyName)」（设置开关开着也可能）：列表删除 ChatGPT助手 → 再添加 → 完全退出应用再开")
     }
     var lastBadgeTitles = ""
     var lastBadges: [Badge] = []
@@ -1751,22 +1768,42 @@ func runWatchDaemon() {
             let whyErr = b.errorMsg.map { String($0.prefix(40)) } ?? ""
             lastAttemptAt[b.title] = Date()
             var done = false
+            var skipUI = false
 
             // ---- Tier A: codex queue first（不依赖窗口 / Space）----
             if settings.useCodexQueue, let tid = b.threadId, !tid.isEmpty {
                 log("继续 [\(b.title)] source=\(b.source)\(whyErr.isEmpty ? "" : " ← \(whyErr)") → codex queue 优先")
                 if let qerr = queueContinue(threadId: tid) {
-                    log("⚠ [\(b.title)] codex queue 失败：\(qerr) → 抢焦点兜底")
                     note(b.title, "failed", "codex queue：\(qerr)")
+                    if isServerBusyError(qerr) || isServerBusyError(whyErr) {
+                        // 429/503：UI 再塞 continue 只会堆字，帮不上忙
+                        log("⚠ [\(b.title)] 服务端限流/过载，跳过 UI 兜底：\(qerr)")
+                        lastFailReason[b.title] = String(qerr.prefix(48))
+                        quickFails[b.title] = min(fails + 1, 4)
+                        skipUI = true
+                    } else {
+                        log("⚠ [\(b.title)] codex queue 失败：\(qerr) → UI 兜底")
+                    }
                 } else if finishContinue(via: "codex queue", punish: false) {
                     done = true
+                } else if isServerBusyError(whyErr) {
+                    log("⚠ [\(b.title)] queue 后 rollout 未起且会话为限流，跳过 UI")
+                    lastFailReason[b.title] = whyErr.isEmpty ? "限流·rollout 未开始" : whyErr
+                    quickFails[b.title] = min(fails + 1, 4)
+                    skipUI = true
                 } else {
-                    log("⚠ [\(b.title)] codex queue 后 rollout 未开始 → 抢焦点兜底")
+                    log("⚠ [\(b.title)] codex queue 后 rollout 未开始 → UI 兜底")
                 }
+            } else if isServerBusyError(whyErr) {
+                // queue 未开时：限流也不要抢焦点堆 continue
+                log("⚠ [\(b.title)] 服务端限流/过载，跳过 UI：\(whyErr)")
+                lastFailReason[b.title] = whyErr
+                quickFails[b.title] = min(fails + 1, 4)
+                skipUI = true
             }
 
-            // ---- Tier B: 卡住时短暂抢焦点，再 AX / agent-desktop（无盲发）----
-            if !done {
+            // ---- Tier B: UI 兜底（写一次 continue → 提交；限流时跳过）----
+            if !done && !skipUI {
                 let axReady = composerAXReady(pid: pid, appName: appName)
                 if isOffscreen || !axReady {
                     log("继续 [\(b.title)] → 抢焦点兜底发送（offscreen=\(isOffscreen) ax=\(axReady)）")
@@ -1787,12 +1824,12 @@ func runWatchDaemon() {
                 }
                 let send = sendContinue(win: win, wid: wid, name: b.title, pid: pid)
                 if let reason = send.error {
-                    log("✗ [\(b.title)] 抢焦点发送失败：\(reason)")
-                    note(b.title, "failed", "抢焦点·\(reason)")
-                    lastFailReason[b.title] = "抢焦点·\(reason)"
+                    log("✗ [\(b.title)] UI 发送失败：\(reason)")
+                    note(b.title, "failed", "UI·\(reason)")
+                    lastFailReason[b.title] = "UI·\(reason)"
                     quickFails[b.title] = min(fails + 1, 4)
                 } else {
-                    let method = "抢焦点·\(send.method ?? "UI")"
+                    let method = "UI·\(send.method ?? "submit")"
                     _ = finishContinue(via: method)
                 }
             }

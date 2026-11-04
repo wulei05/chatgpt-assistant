@@ -32,7 +32,7 @@ each poll:
       else:
         if offscreen / no AX → stealFocusBriefly (activate / focus-window)
         ensureOpen(title)     // agent-desktop → AX
-        sendContinue(...)     // AD/AX/PostToPid；无盲发
+        sendContinue(...)     // 写一次 continue → 提交；429/503 跳过 UI
         waitRolloutStarted
           ok  → markHandled
           fail → backoff
