@@ -5,17 +5,14 @@ import Darwin
 import Foundation
 import Vision
 
-let base: String = {
-    let exe = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
-    return exe.deletingLastPathComponent().path
-}()
-let logPath = base + "/chatgpt-assistant.log"
-let stopFile = base + "/STOP"
-let scanNowFile = base + "/SCAN_NOW"
-let settingsFile = base + "/settings.json"
-let handledFile = base + "/handled.txt"
-let cliPath = base + "/cli"
-let keyPath = base + "/key"
+let base = AppPaths.dataDir
+let logPath = AppPaths.logPath
+let stopFile = AppPaths.stopPath
+let scanNowFile = AppPaths.scanNowPath
+let settingsFile = AppPaths.settingsPath
+let handledFile = AppPaths.handledPath
+let cliPath = AppPaths.macOSDir + "/cli"
+let keyPath = AppPaths.macOSDir + "/key"
 let sessionsRoot = NSString(string: "~/.codex/sessions").expandingTildeInPath
 let indexFile = NSString(string: "~/.codex/session_index.jsonl").expandingTildeInPath
 
@@ -1446,8 +1443,8 @@ if CommandLine.arguments.contains("--scan-badges") {
     exit(0)
 }
 // ---------- main ----------
-let stateFile = base + "/state.json"
-let pauseFile = base + "/PAUSE"
+let stateFile = AppPaths.statePath
+let pauseFile = AppPaths.pausePath
 // Keep AppKit services alive for Vision/NSImage without becoming a dock app.
 _ = NSApplication.shared
 NSApp.setActivationPolicy(.accessory)

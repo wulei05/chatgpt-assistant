@@ -1,32 +1,27 @@
 #!/bin/bash
-# Fully detach ChatGPTAssistantBar (menu bar). Avoid osascript — it often hangs for Automation permission.
 set -e
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
-pkill -x ChatGPTAssistantBar 2>/dev/null || true
+pkill -x CGPTBar 2>/dev/null || true
 sleep 0.3
-/usr/bin/python3 - <<PY
-import os, sys, time
-base = "$ROOT"
-bin_path = os.path.join(base, "ChatGPTAssistantBar")
-if os.fork() > 0:
-    time.sleep(0.4)
-    sys.exit(0)
-os.setsid()
-if os.fork() > 0:
-    sys.exit(0)
-os.chdir(base)
-os.umask(0)
-devnull = open(os.devnull, "rb")
-log = open(os.path.join(base, "bar.log"), "a")
-os.dup2(devnull.fileno(), 0)
-os.dup2(log.fileno(), 1)
-os.dup2(log.fileno(), 2)
-os.execv(bin_path, [bin_path])
-PY
+
+APP="$ROOT/ChatGPT Assistant.app"
+if [[ -d "$APP" ]]; then
+  open "$APP"
+  sleep 1
+  if pgrep -x CGPTBar >/dev/null; then
+    echo "OK app pid=$(pgrep -x CGPTBar)"
+    exit 0
+  fi
+fi
+
+export CHATGPT_ASSISTANT_HOME="${CHATGPT_ASSISTANT_HOME:-$ROOT}"
+BIN="$ROOT/CGPTBar"
+nohup env CHATGPT_ASSISTANT_HOME="$CHATGPT_ASSISTANT_HOME" "$BIN" \
+  >>"$CHATGPT_ASSISTANT_HOME/bar.log" 2>&1 </dev/null &
 sleep 0.5
-if pgrep -x ChatGPTAssistantBar >/dev/null; then
-  echo "OK pid=$(pgrep -x ChatGPTAssistantBar)"
+if pgrep -x CGPTBar >/dev/null; then
+  echo "OK pid=$(pgrep -x CGPTBar)"
 else
-  echo "FAIL: ChatGPTAssistantBar did not stay up"; exit 1
+  echo "FAIL: CGPTBar did not stay up"; exit 1
 fi

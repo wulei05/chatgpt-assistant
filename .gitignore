@@ -2,6 +2,8 @@
 dist/
 chatgpt-assistant
 ChatGPTAssistantBar
+CGPTBar
+cgpt-daemon
 CodexWatchBar
 watch3
 watch3.prev
@@ -11,6 +13,7 @@ key
 mpos
 probe2
 wstate
+*.app/
 
 # Runtime
 *.log

@@ -1,17 +1,12 @@
 import AppKit
 import Foundation
 
-let base: String = {
-    let exe = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
-    return exe.deletingLastPathComponent().path
-}()
-let statePath = base + "/state.json"
-let settingsPath = base + "/settings.json"
-let pausePath = base + "/PAUSE"
-let stopPath = base + "/STOP"
-let scanNowPath = base + "/SCAN_NOW"
-let logPath = base + "/chatgpt-assistant.log"
-let startScript = base + "/start-daemon.sh"
+let statePath = AppPaths.statePath
+let settingsPath = AppPaths.settingsPath
+let pausePath = AppPaths.pausePath
+let stopPath = AppPaths.stopPath
+let scanNowPath = AppPaths.scanNowPath
+let logPath = AppPaths.logPath
 
 func readJSON(_ path: String) -> [String: Any]? {
     guard let d = try? Data(contentsOf: URL(fileURLWithPath: path)),
@@ -615,14 +610,7 @@ final class Controller: NSObject, NSMenuDelegate {
     }
 
     @objc func startWatch() {
-        try? FileManager.default.removeItem(atPath: stopPath)
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/bash")
-        p.arguments = [startScript]
-        p.currentDirectoryURL = URL(fileURLWithPath: base)
-        p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
-        try? p.run()
+        _ = AppPaths.launchDaemon()
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in self?.refresh() }
     }
 
@@ -707,8 +695,7 @@ final class Controller: NSObject, NSMenuDelegate {
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: logPath)])
     }
     @objc func openSpec() {
-        let path = base + "/SPEC.md"
-        NSWorkspace.shared.open(URL(fileURLWithPath: path))
+        NSWorkspace.shared.open(URL(fileURLWithPath: AppPaths.specPath))
     }
     @objc func quit() { NSApp.terminate(nil) }
 }
@@ -716,4 +703,14 @@ final class Controller: NSObject, NSMenuDelegate {
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 let controller = Controller()
+// App 启动时自动拉起监控（若未运行且无 STOP）
+DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+    if !FileManager.default.fileExists(atPath: AppPaths.stopPath) {
+        let alive: Bool = {
+            guard let st = readJSON(AppPaths.statePath), let pid = st["pid"] as? Int else { return false }
+            return pidAlive(pid)
+        }()
+        if !alive { _ = AppPaths.launchDaemon() }
+    }
+}
 withExtendedLifetime(controller) { app.run() }
