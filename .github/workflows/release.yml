@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to build (e.g. v0.2.2). Leave empty to build HEAD without creating a release."
+        description: "Tag to build (e.g. v0.2.3). Leave empty to build HEAD without creating a release."
         required: false
         default: ""
 
@@ -17,14 +17,18 @@ permissions:
 jobs:
   build-macos:
     runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, x86_64]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build universal .app (arm64 + x86_64)
+      - name: Build .app (${{ matrix.arch }})
         run: |
           chmod +x build.sh start-daemon.sh start-bar.sh
-          ARCH=universal ./build.sh dist app
+          ARCH=${{ matrix.arch }} ./build.sh dist app
           lipo -info "dist/ChatGPT Assistant.app/Contents/MacOS/cgpt-daemon"
           lipo -info "dist/ChatGPT Assistant.app/Contents/MacOS/CGPTBar"
 
@@ -37,16 +41,17 @@ jobs:
           if [[ -z "$VERSION" || "$VERSION" == *"/"* ]]; then
             VERSION="head-$(git rev-parse --short HEAD)"
           fi
-          ARCHIVE="ChatGPT-Assistant-${VERSION}-macos-universal.zip"
+          ARCH="${{ matrix.arch }}"
+          ARCHIVE="ChatGPT-Assistant-${VERSION}-macos-${ARCH}.zip"
           ditto -c -k --sequesterRsrc --keepParent "dist/ChatGPT Assistant.app" "${ARCHIVE}"
-          echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
           ls -lh "${ARCHIVE}"
           shasum -a 256 "${ARCHIVE}" | tee "${ARCHIVE}.sha256"
+          echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: chatgpt-assistant-macos-universal
+          name: chatgpt-assistant-macos-${{ matrix.arch }}
           path: |
             ChatGPT-Assistant-*.zip
             ChatGPT-Assistant-*.zip.sha256
@@ -59,10 +64,12 @@ jobs:
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" "$ARCHIVE" "${ARCHIVE}.sha256" --clobber
           else
+            # First matrix leg may create the release; others upload.
             gh release create "$GITHUB_REF_NAME" \
               "$ARCHIVE" \
               "${ARCHIVE}.sha256" \
               --title "ChatGPT助手 ${GITHUB_REF_NAME}" \
               --generate-notes \
-              --verify-tag
+              --verify-tag \
+              || gh release upload "$GITHUB_REF_NAME" "$ARCHIVE" "${ARCHIVE}.sha256" --clobber
           fi
