@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to build (e.g. v0.2.0). Leave empty to build HEAD without creating a release."
+        description: "Tag to build (e.g. v0.2.2). Leave empty to build HEAD without creating a release."
         required: false
         default: ""
 
@@ -21,10 +21,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build .app
+      - name: Build universal .app (arm64 + x86_64)
         run: |
           chmod +x build.sh start-daemon.sh start-bar.sh
-          ./build.sh dist app
+          ARCH=universal ./build.sh dist app
+          lipo -info "dist/ChatGPT Assistant.app/Contents/MacOS/cgpt-daemon"
+          lipo -info "dist/ChatGPT Assistant.app/Contents/MacOS/CGPTBar"
 
       - name: Package
         run: |
@@ -35,7 +37,7 @@ jobs:
           if [[ -z "$VERSION" || "$VERSION" == *"/"* ]]; then
             VERSION="head-$(git rev-parse --short HEAD)"
           fi
-          ARCHIVE="ChatGPT-Assistant-${VERSION}-macos-arm64.zip"
+          ARCHIVE="ChatGPT-Assistant-${VERSION}-macos-universal.zip"
           ditto -c -k --sequesterRsrc --keepParent "dist/ChatGPT Assistant.app" "${ARCHIVE}"
           echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
           ls -lh "${ARCHIVE}"
@@ -44,7 +46,7 @@ jobs:
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: chatgpt-assistant-macos
+          name: chatgpt-assistant-macos-universal
           path: |
             ChatGPT-Assistant-*.zip
             ChatGPT-Assistant-*.zip.sha256

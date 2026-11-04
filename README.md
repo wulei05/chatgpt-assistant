@@ -6,8 +6,8 @@ macOS **菜单栏 App**：根据本地 Codex **运行记录（rollout）** 发�
 
 ## 安装（推荐）
 
-1. 从 [Releases](https://github.com/wulei05/chatgpt-assistant/releases) 下载 `ChatGPT-Assistant-*-macos-arm64.zip`
-2. 解压得到 `ChatGPT Assistant.app`，拖到「应用程序」
+1. 从 [Releases](https://github.com/wulei05/chatgpt-assistant/releases) 下载 `ChatGPT-Assistant-*-macos-universal.zip`
+2. 解压得到 `ChatGPT Assistant.app`，拖到「应用程序」（Apple Silicon / Intel 通用）
 3. 首次如被拦截：右键 → 打开
 4. 菜单栏出现圆点（无 Dock 图标）
 5. 「系统设置 → 隐私与安全性 → 辅助功能」勾选 **ChatGPT助手**
@@ -19,14 +19,16 @@ macOS **菜单栏 App**：根据本地 Codex **运行记录（rollout）** 发�
 ## 本地构建
 
 ```bash
-./build.sh dist app    # 产出 dist/ChatGPT Assistant.app
+ARCH=universal ./build.sh dist app   # 默认也是 universal（arm64 + x86_64）
+ARCH=arm64 ./build.sh dist app       # 仅 Apple Silicon
+ARCH=x86_64 ./build.sh dist app      # 仅 Intel
 open "dist/ChatGPT Assistant.app"
 ```
 
 ## 开发模式（不装 .app）
 
 ```bash
-./build.sh . bin
+ARCH=arm64 ./build.sh . bin
 ./start-daemon.sh
 ./start-bar.sh
 ```
