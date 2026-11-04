@@ -27,6 +27,7 @@ clip.bak
 
 # Debug captures / probes
 *.png
+!assets/*.png
 mpos.swift
 probe2.swift
 wstate.swift
