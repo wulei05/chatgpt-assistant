@@ -12,7 +12,8 @@ macOS **菜单栏 App**：根据本地 Codex **运行记录（rollout）** 发�
 2. 解压得到 `ChatGPT Assistant.app`，拖到「应用程序」
 3. 首次如被拦截：右键 → 打开
 4. 菜单栏出现圆点（无 Dock 图标）
-5. 「系统设置 → 隐私与安全性 → 辅助功能」勾选 **ChatGPT助手**
+5. 「系统设置 → 隐私与安全性 → **辅助功能**」勾选 **ChatGPT助手**  
+   （注意：不是「设备控制 / 数据访问」；那是另一项，勾了也消不掉「未开辅助功能」提示）
 
 运行数据：`~/Library/Application Support/ChatGPT助手/`
 

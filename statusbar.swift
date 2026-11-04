@@ -356,8 +356,9 @@ final class Controller: NSObject, NSMenuDelegate {
             meta("   ⚠ 窗口在其他 Space", color: .systemOrange)
         }
         if (s.state?["ax"] as? Bool) == false {
-            meta("   ⚠ 未开辅助功能（系统设置 → 隐私与安全性 → 辅助功能）", color: .systemYellow)
-            meta("   请勾选 ChatGPT助手；改完后点「开启监控」或重启 App", color: .systemYellow)
+            meta("   ⚠ 未开「辅助功能」（不是「设备控制/数据访问」）", color: .systemYellow)
+            meta("   系统设置 → 隐私与安全性 → 辅助功能 → 勾选 ChatGPT助手", color: .systemYellow)
+            meta("   改完后退出应用再打开", color: .systemYellow)
         }
 
         // Width: idle comfortable, pending a bit wider (scan-row view is the width rail).
