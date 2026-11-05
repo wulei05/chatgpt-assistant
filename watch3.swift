@@ -118,8 +118,32 @@ func waitPoll(_ seconds: Double) -> Bool {
         Thread.sleep(forTimeInterval: min(0.25, left))
     }
 }
+/// GUI apps launched from Finder/Dock only get `/usr/bin:/bin:/usr/sbin:/sbin`.
+/// Homebrew CLIs (codex → `#!/usr/bin/env node`) need `/opt/homebrew/bin` etc.
+func cliEnvironment(extraBinDirs: [String] = []) -> [String: String] {
+    var env = ProcessInfo.processInfo.environment
+    let extras = extraBinDirs.filter { !$0.isEmpty } + [
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+        "/usr/local/bin",
+        "/usr/local/sbin",
+        NSString(string: "~/.local/bin").expandingTildeInPath,
+    ]
+    let existing = (env["PATH"] ?? "").split(separator: ":").map(String.init)
+    var seen = Set(existing)
+    var prefix: [String] = []
+    for d in extras where FileManager.default.fileExists(atPath: d) && !seen.contains(d) {
+        prefix.append(d)
+        seen.insert(d)
+    }
+    env["PATH"] = (prefix + existing).joined(separator: ":")
+    return env
+}
 func run(_ path: String, _ args: [String]) -> String {
-    let p = Process(); p.executableURL = URL(fileURLWithPath: path); p.arguments = args
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: path)
+    p.arguments = args
+    p.environment = cliEnvironment(extraBinDirs: [URL(fileURLWithPath: path).deletingLastPathComponent().path])
     let pipe = Pipe(); p.standardOutput = pipe; p.standardError = FileHandle.nullDevice
     do { try p.run() } catch { return "" }
     p.waitUntilExit()
@@ -129,6 +153,7 @@ func runCapture(_ path: String, _ args: [String], timeoutSec: Double = 45) -> (c
     let p = Process()
     p.executableURL = URL(fileURLWithPath: path)
     p.arguments = args
+    p.environment = cliEnvironment(extraBinDirs: [URL(fileURLWithPath: path).deletingLastPathComponent().path])
     let outPipe = Pipe(), errPipe = Pipe()
     p.standardOutput = outPipe
     p.standardError = errPipe
