@@ -1,6 +1,8 @@
 import AppKit
 import ApplicationServices
+import Darwin
 import Foundation
+import UniformTypeIdentifiers
 
 let statePath = AppPaths.statePath
 let settingsPath = AppPaths.settingsPath
@@ -619,6 +621,10 @@ final class Controller: NSObject, NSMenuDelegate {
         reveal.target = self
         menu.addItem(reveal)
 
+        let export = NSMenuItem(title: "导出诊断包…", action: #selector(exportDiagnostics), keyEquivalent: "")
+        export.target = self
+        menu.addItem(export)
+
         let quit = NSMenuItem(title: "退出应用", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
@@ -709,6 +715,108 @@ final class Controller: NSObject, NSMenuDelegate {
     @objc func openLog() {
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: logPath)])
     }
+
+    /// Zip log + settings/state + machine summary for users to send when reporting bugs.
+    @objc func exportDiagnostics() {
+        let stamp = ISO8601DateFormatter()
+        stamp.formatOptions = [.withFullDate, .withTime, .withDashSeparatorInDate, .withColonSeparatorInTime]
+        let short = DateFormatter()
+        short.dateFormat = "yyyyMMdd-HHmmss"
+        let defaultName = "ChatGPT助手-诊断-\(short.string(from: Date())).zip"
+
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.zip]
+        panel.canCreateDirectories = true
+        panel.isExtensionHidden = false
+        panel.nameFieldStringValue = defaultName
+        panel.title = "导出诊断包"
+        panel.message = "包含日志、settings、state 与环境摘要，可发给开发者排查。"
+        panel.directoryURL = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
+
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let dest = panel.url else { return }
+
+        let fm = FileManager.default
+        let tmp = fm.temporaryDirectory.appendingPathComponent("cgpt-diag-\(UUID().uuidString)", isDirectory: true)
+        do {
+            try fm.createDirectory(at: tmp, withIntermediateDirectories: true)
+
+            let ver = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+            let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+            let os = ProcessInfo.processInfo.operatingSystemVersion
+            let osStr = "\(os.majorVersion).\(os.minorVersion).\(os.patchVersion)"
+            let ax = AXIsProcessTrusted()
+            let codex = resolveCodexPath() ?? "(未找到)"
+            let summary = """
+            ChatGPT助手 诊断包
+            exportedAt: \(stamp.string(from: Date()))
+            appVersion: \(ver) (\(build))
+            bundleId: \(Bundle.main.bundleIdentifier ?? "?")
+            appPath: \(Bundle.main.bundleURL.path)
+            macOS: \(osStr)
+            arch: \(Self.machineArch())
+            AXIsProcessTrusted: \(ax)
+            accessibilityPane: \(AppPaths.accessibilityPrivacyName)
+            dataDir: \(AppPaths.dataDir)
+            codexResolved: \(codex)
+            agentDesktop: \((readSettings()["agentDesktopPath"] as? String) ?? "?")
+            pid: \(ProcessInfo.processInfo.processIdentifier)
+
+            请把此 zip 发给开发者。内含运行日志与配置（可能含会话标题等本地信息）。
+            """
+            try summary.write(to: tmp.appendingPathComponent("DIAGNOSTICS.txt"), atomically: true, encoding: String.Encoding.utf8)
+
+            let copies = [
+                ("chatgpt-assistant.log", AppPaths.logPath),
+                ("settings.json", AppPaths.settingsPath),
+                ("state.json", AppPaths.statePath),
+                ("handled.txt", AppPaths.handledPath),
+            ]
+            for (name, path) in copies {
+                if fm.fileExists(atPath: path) {
+                    try? fm.copyItem(atPath: path, toPath: tmp.appendingPathComponent(name).path)
+                } else {
+                    try? "(missing)\n".write(to: tmp.appendingPathComponent(name), atomically: true, encoding: .utf8)
+                }
+            }
+
+            if fm.fileExists(atPath: dest.path) { try fm.removeItem(at: dest) }
+            let zip = Process()
+            zip.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+            zip.arguments = ["-c", "-k", "--sequesterRsrc", "--keepParent", tmp.path, dest.path]
+            try zip.run()
+            zip.waitUntilExit()
+            try? fm.removeItem(at: tmp)
+
+            guard zip.terminationStatus == 0, fm.fileExists(atPath: dest.path) else {
+                Self.alert(title: "导出失败", text: "无法写入 \(dest.lastPathComponent)")
+                return
+            }
+            NSWorkspace.shared.activateFileViewerSelecting([dest])
+            Self.alert(title: "已导出诊断包", text: "文件：\(dest.lastPathComponent)\n发给开发者即可。")
+        } catch {
+            try? fm.removeItem(at: tmp)
+            Self.alert(title: "导出失败", text: error.localizedDescription)
+        }
+    }
+
+    private static func machineArch() -> String {
+        var sys = utsname()
+        uname(&sys)
+        return withUnsafePointer(to: &sys.machine) {
+            $0.withMemoryRebound(to: CChar.self, capacity: 1) { String(cString: $0) }
+        }
+    }
+
+    private static func alert(title: String, text: String) {
+        let a = NSAlert()
+        a.messageText = title
+        a.informativeText = text
+        a.alertStyle = .informational
+        a.addButton(withTitle: "好")
+        a.runModal()
+    }
+
     @objc func openSpec() {
         NSWorkspace.shared.open(URL(fileURLWithPath: AppPaths.specPath))
     }
