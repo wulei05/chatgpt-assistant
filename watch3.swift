@@ -987,6 +987,15 @@ func isServerBusyError(_ msg: String) -> Bool {
         || low.contains("too many") || low.contains("overloaded") || low.contains("capacity")
 }
 
+/// Local tooling / env failures launching `codex` — always fall back to AX / agent-desktop.
+func isLocalQueueToolingError(_ msg: String) -> Bool {
+    let low = msg.lowercased()
+    return low.contains("env: node") || low.contains("no such file")
+        || low.contains("找不到 codex") || low.contains("无法启动")
+        || low.contains("not found") || low.contains("permission denied")
+        || low.contains("超时")
+}
+
 /// CUA tiers: write continue at most once → submit. Never activate / switch Space here.
 /// On success `method` is a short tag for 最近动作（agent-desktop / AX / PostToPid …）.
 func sendContinue(win: CGRect, wid: Int, name: String, pid: pid_t) -> (method: String?, error: String?) {
@@ -1800,9 +1809,18 @@ func runWatchDaemon() {
                 log("继续 [\(b.title)] source=\(b.source)\(whyErr.isEmpty ? "" : " ← \(whyErr)") → codex queue 优先")
                 if let qerr = queueContinue(threadId: tid) {
                     note(b.title, "failed", "codex queue：\(qerr)")
-                    if isServerBusyError(qerr) || isServerBusyError(whyErr) {
-                        // 429/503：UI 再塞 continue 只会堆字，帮不上忙
+                    if isLocalQueueToolingError(qerr) {
+                        // PATH / 缺 node 等：queue 根本没发出去，必须 UI 兜底（勿被会话里的旧 429 带偏）
+                        log("⚠ [\(b.title)] codex queue 本地失败：\(qerr) → UI 兜底")
+                    } else if isServerBusyError(qerr) {
+                        // queue 本身返回限流：UI 再塞 continue 只会堆字
                         log("⚠ [\(b.title)] 服务端限流/过载，跳过 UI 兜底：\(qerr)")
+                        lastFailReason[b.title] = String(qerr.prefix(48))
+                        quickFails[b.title] = min(fails + 1, 4)
+                        skipUI = true
+                    } else if isServerBusyError(whyErr) {
+                        // queue 失败原因不明，但会话已是 429：跳过 UI，避免堆字
+                        log("⚠ [\(b.title)] queue 失败且会话限流，跳过 UI：\(qerr)")
                         lastFailReason[b.title] = String(qerr.prefix(48))
                         quickFails[b.title] = min(fails + 1, 4)
                         skipUI = true
