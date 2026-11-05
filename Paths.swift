@@ -72,6 +72,8 @@ enum AppPaths {
     static var scanNowPath: String { dataDir + "/SCAN_NOW" }
     static var logPath: String { dataDir + "/chatgpt-assistant.log" }
     static var handledPath: String { dataDir + "/handled.txt" }
+    /// Tracks last launched app CDHash to detect upgrade → AX re-grant needed.
+    static var axIdentityPath: String { dataDir + "/ax-identity.json" }
     static var specPath: String {
         let inResources = resourcesDir + "/SPEC.md"
         if FileManager.default.fileExists(atPath: inResources) { return inResources }

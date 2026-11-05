@@ -89,8 +89,54 @@ func shortError(_ err: String) -> String {
     let e = err.lowercased()
     if e.contains("429") || e.contains("too many requests") { return "429 限流" }
     if e.contains("at capacity") || e.contains("capacity") { return "模型容量满" }
+    if isLocalQueueToolingError(err) {
+        if e.contains("env: node") { return "缺 node" }
+        if e.contains("找不到 codex") || e.contains("auto") { return "找不到 codex" }
+        return "工具故障"
+    }
     if err.count <= 28 { return err }
     return String(err.prefix(28)) + "…"
+}
+
+func kindTag(_ kind: String) -> String {
+    "[\(failKindLabel(kind))]"
+}
+
+/// CDHash of the running .app (adhoc rebuilds change this → AX grant often drops).
+func appCodeDirectoryHash() -> String? {
+    let path = Bundle.main.bundlePath
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+    p.arguments = ["-dv", "--verbose=4", path]
+    let errPipe = Pipe()
+    p.standardError = errPipe
+    p.standardOutput = FileHandle.nullDevice
+    do { try p.run() } catch { return nil }
+    p.waitUntilExit()
+    let s = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    for line in s.split(whereSeparator: \.isNewline) {
+        if line.hasPrefix("CDHash=") { return String(line.dropFirst(7)) }
+    }
+    return nil
+}
+
+/// Returns true when App binary changed since last launch and AX is still false.
+func checkAxIdentityAfterUpdate() -> (upgraded: Bool, message: String?) {
+    let path = AppPaths.axIdentityPath
+    let hash = appCodeDirectoryHash() ?? "unknown"
+    var prev: [String: Any] = readJSON(path) ?? [:]
+    let old = prev["cdHash"] as? String
+    prev["cdHash"] = hash
+    prev["updatedAt"] = ISO8601DateFormatter().string(from: Date())
+    writeJSON(path, prev)
+    guard let old, !old.isEmpty, old != hash else {
+        return (false, nil)
+    }
+    if AXIsProcessTrusted() {
+        return (true, "检测到应用已更新（签名变化）；当前 AX 仍有效")
+    }
+    let pane = AppPaths.accessibilityPrivacyName
+    return (true, "检测到应用已更新，请重新授权「\(pane)」：列表删除 → 再添加 → ⌘Q 后重开")
 }
 /// Truncate by character count (CJK-friendly enough for menu width).
 func clipTitle(_ s: String, _ maxChars: Int) -> String {
@@ -105,6 +151,8 @@ final class Controller: NSObject, NSMenuDelegate {
     var menuIsOpen = false
     var lastMenuFingerprint = ""
     var menuKeyMonitor: Any?
+    /// Set once at launch when CDHash changed and AX is off.
+    var axUpgradeHint: String?
 
     override init() {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -112,6 +160,8 @@ final class Controller: NSObject, NSMenuDelegate {
         menu.delegate = self
         menu.autoenablesItems = false
         item.menu = menu
+        let axCheck = checkAxIdentityAfterUpdate()
+        if axCheck.upgraded { axUpgradeHint = axCheck.message }
         refresh()
         let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in self?.refresh() }
         RunLoop.main.add(t, forMode: .common)
@@ -173,7 +223,12 @@ final class Controller: NSObject, NSMenuDelegate {
         let next = s.badges.map { "\(badgeNextRunSec($0))" }.joined(separator: ",")
         // Live AX — same process as in-app watch; include so open menu drops the yellow banner when TCC catches up.
         let ax = AXIsProcessTrusted() ? "1" : "0"
-        return "\(s.alive)-\(Int(s.heartbeatAge))-\(s.badges.count)-\(ms)-\(pending)-\(act)-\(actRes)-\(s.paused)-\(next)-\(ax)"
+        let rate = s.badges.filter {
+            let e = ($0["error"] as? String) ?? ""
+            return (($0["failKind"] as? String) ?? classifyFailKind(e)) == "rateLimit"
+        }.count
+        let bo = s.backoff.map { "\(($0["failKind"] as? String) ?? "")\(($0["remainSec"] as? Int) ?? 0)" }.joined()
+        return "\(s.alive)-\(Int(s.heartbeatAge))-\(s.badges.count)-\(ms)-\(pending)-\(act)-\(actRes)-\(s.paused)-\(next)-\(ax)-\(rate)-\(bo)"
     }
 
     /// Custom view button — clicking does not dismiss the status menu. Shows ⌘R affordance.
@@ -363,7 +418,12 @@ final class Controller: NSObject, NSMenuDelegate {
         // Prefer live API (in-app daemon shares this process). state.json can lag right after launch.
         let axLive = AXIsProcessTrusted()
         let axState = s.state?["ax"] as? Bool
-        if !axLive {
+        if let hint = axUpgradeHint, !axLive {
+            meta("   ⚠ \(hint)", color: .systemYellow)
+            let openAx = NSMenuItem(title: "打开「\(AppPaths.accessibilityPrivacyName)」设置…", action: #selector(openAccessibilityPrivacy), keyEquivalent: "")
+            openAx.target = self
+            menu.addItem(openAx)
+        } else if !axLive {
             let pane = AppPaths.accessibilityPrivacyName
             meta("   ⚠ 系统 API 仍返回未授权「\(pane)」", color: .systemYellow)
             meta("   设置里开关开着也会这样：授权按代码签名绑定，更新 App 后常失效", color: .systemYellow)
@@ -374,6 +434,8 @@ final class Controller: NSObject, NSMenuDelegate {
             let openAx = NSMenuItem(title: "打开「\(pane)」设置…", action: #selector(openAccessibilityPrivacy), keyEquivalent: "")
             openAx.target = self
             menu.addItem(openAx)
+        } else if let hint = axUpgradeHint, hint.contains("仍有效") {
+            meta("   \(hint)", color: mute)
         }
 
         // Width: idle comfortable, pending a bit wider (scan-row view is the width rail).
@@ -382,7 +444,40 @@ final class Controller: NSObject, NSMenuDelegate {
         let actionLimit = hasWork ? 6 : 5
         let menuWidth: CGFloat = hasWork ? 380 : 300
 
-        // —— Pending ——
+        // —— Rate-limit board (1) ——
+        var rateRows: [(title: String, remain: Int, note: String)] = []
+        for b in s.badges {
+            let err = (b["error"] as? String) ?? ""
+            let kind = (b["failKind"] as? String) ?? classifyFailKind(err)
+            guard kind == "rateLimit" || isServerBusyError(err) else { continue }
+            let n = badgeNextRunSec(b)
+            rateRows.append(((b["title"] as? String) ?? "?", n, shortError(err)))
+        }
+        for b in s.backoff {
+            let why = (b["reason"] as? String) ?? ""
+            let kind = (b["failKind"] as? String) ?? classifyFailKind(why)
+            guard kind == "rateLimit" || isServerBusyError(why) else { continue }
+            let title = (b["title"] as? String) ?? "?"
+            if rateRows.contains(where: { $0.title == title }) { continue }
+            let r = (b["remainSec"] as? Int) ?? 0
+            rateRows.append((title, r, shortError(why.isEmpty ? "429" : why)))
+        }
+        rateRows.sort { $0.remain < $1.remain }
+
+        menu.addItem(.separator())
+        if rateRows.isEmpty {
+            section("限流看板")
+            meta("   当前没有因 429/容量 等待的会话")
+        } else {
+            section("限流看板 · \(rateRows.count)")
+            for row in rateRows.prefix(8) {
+                add("●  \(clipTitle(row.title, titleChars))", color: .systemOrange)
+                let when = row.remain <= 0 ? "下一轮可再试" : "约 \(durationText(row.remain)) 后可再试"
+                meta("   \(row.note) · \(when)")
+            }
+        }
+
+        // —— Pending (with fail kind tags) ——
         menu.addItem(.separator())
         let discoverMode = (s.state?["discoverMode"] as? String)
             ?? (cfg["discoverMode"] as? String)
@@ -396,18 +491,32 @@ final class Controller: NSObject, NSMenuDelegate {
                 let t = clipTitle((b["title"] as? String) ?? "?", titleChars)
                 let w = (b["waitingSec"] as? Int) ?? 0
                 let err = (b["error"] as? String) ?? ""
+                let hint = (b["nextRunHint"] as? String) ?? ""
+                let kind = (b["attemptKind"] as? String)
+                    ?? (b["failKind"] as? String)
+                    ?? classifyFailKind(hint.isEmpty ? err : hint)
                 let when: String = {
                     if s.paused { return "已暂停" }
                     let n = badgeNextRunSec(b)
                     if n <= 0 { return "下一轮即执行" }
-                    let hint = (b["nextRunHint"] as? String) ?? ""
                     if hint.contains("冷却") { return "冷却 \(durationText(n))" }
                     return "约 \(durationText(n)) 后"
                 }()
                 add("●  \(t)", color: ink)
-                if !err.isEmpty {
+                let kindColor: NSColor = {
+                    switch kind {
+                    case "rateLimit": return .systemOrange
+                    case "tooling": return .systemPurple
+                    case "ui": return .systemBlue
+                    default: return .systemOrange
+                    }
+                }()
+                if !err.isEmpty || !hint.isEmpty {
+                    let summary = !hint.isEmpty && classifyFailKind(hint) == "tooling"
+                        ? shortError(hint) : shortError(err.isEmpty ? hint : err)
                     rich([
-                        ("   \(shortError(err))", .systemOrange, cap),
+                        ("   \(kindTag(kind)) ", kindColor, cap),
+                        (summary, .systemOrange, cap),
                         (" · \(when)", mute, cap)
                     ])
                     meta("   已等 \(durationText(w))")
@@ -424,10 +533,24 @@ final class Controller: NSObject, NSMenuDelegate {
                 let t = clipTitle((b["title"] as? String) ?? "?", titleChars)
                 let r = (b["remainSec"] as? Int) ?? 0
                 let why = (b["reason"] as? String) ?? ""
+                let kind = (b["failKind"] as? String) ?? classifyFailKind(why)
+                let kindColor: NSColor = {
+                    switch kind {
+                    case "rateLimit": return .systemOrange
+                    case "tooling": return .systemPurple
+                    case "ui": return .systemBlue
+                    default: return .systemYellow
+                    }
+                }()
                 add("●  \(t)", color: .systemYellow)
-                meta(why.isEmpty
-                     ? "   还差 \(durationText(r))"
-                     : "   还差 \(durationText(r)) · \(clipTitle(why, hasWork ? 24 : 14))")
+                if why.isEmpty {
+                    meta("   还差 \(durationText(r))")
+                } else {
+                    rich([
+                        ("   \(kindTag(kind)) ", kindColor, cap),
+                        ("还差 \(durationText(r)) · \(clipTitle(shortError(why), hasWork ? 22 : 12))", mute, cap)
+                    ])
+                }
             }
         }
 
@@ -621,6 +744,10 @@ final class Controller: NSObject, NSMenuDelegate {
         reveal.target = self
         menu.addItem(reveal)
 
+        let copySum = NSMenuItem(title: "复制诊断摘要", action: #selector(copyDiagnosticsSummary), keyEquivalent: "")
+        copySum.target = self
+        menu.addItem(copySum)
+
         let export = NSMenuItem(title: "导出诊断包…", action: #selector(exportDiagnostics), keyEquivalent: "")
         export.target = self
         menu.addItem(export)
@@ -714,6 +841,47 @@ final class Controller: NSObject, NSMenuDelegate {
 
     @objc func openLog() {
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: logPath)])
+    }
+
+    /// Short pasteable blurb for WeChat / IM (feature 3).
+    func buildDiagnosticsSummary() -> String {
+        let ver = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+        let os = ProcessInfo.processInfo.operatingSystemVersion
+        let osStr = "\(os.majorVersion).\(os.minorVersion).\(os.patchVersion)"
+        let st = readJSON(statePath)
+        let badges = (st?["badges"] as? [[String: Any]]) ?? []
+        let backoff = (st?["backoff"] as? [[String: Any]]) ?? []
+        let actions = (st?["actions"] as? [[String: Any]]) ?? []
+        var lines: [String] = [
+            "ChatGPT助手 \(ver)(\(build)) · macOS \(osStr) · \(Self.machineArch())",
+            "AX=\(AXIsProcessTrusted() ? "on" : "off") · codex=\(resolveCodexPath() ?? "missing")",
+        ]
+        if let hint = axUpgradeHint { lines.append("升级提示: \(hint)") }
+        let rateN = badges.filter {
+            let e = ($0["error"] as? String) ?? ""
+            return (($0["failKind"] as? String) ?? classifyFailKind(e)) == "rateLimit" || isServerBusyError(e)
+        }.count
+        lines.append("待继续 \(badges.count) · 退避 \(backoff.count) · 限流看板 \(rateN)")
+        let recentFails = actions.reversed().filter { ($0["result"] as? String) == "failed" || ($0["result"] as? String) == "backoff" }
+        for a in recentFails.prefix(3) {
+            let clock = (a["clock"] as? String) ?? ""
+            let title = clipTitle((a["title"] as? String) ?? "?", 18)
+            let detail = clipTitle((a["detail"] as? String) ?? "", 36)
+            let kind = failKindLabel(classifyFailKind(detail))
+            lines.append("· \(clock) [\(kind)] \(title): \(detail)")
+        }
+        if recentFails.isEmpty {
+            lines.append("· 最近无失败记录")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    @objc func copyDiagnosticsSummary() {
+        let text = buildDiagnosticsSummary()
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        Self.alert(title: "已复制诊断摘要", text: "可直接粘贴到微信/邮件发给开发者。")
     }
 
     /// Zip log + settings/state + machine summary for users to send when reporting bugs.

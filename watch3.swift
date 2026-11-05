@@ -1013,6 +1013,30 @@ func isLocalQueueToolingError(_ msg: String) -> Bool {
         || low.contains("超时")
 }
 
+/// Coarse failure class for menu / diagnostics: rateLimit | tooling | ui | other
+func classifyFailKind(_ msg: String) -> String {
+    if msg.isEmpty { return "other" }
+    if isLocalQueueToolingError(msg) { return "tooling" }
+    if isServerBusyError(msg) { return "rateLimit" }
+    let low = msg.lowercased()
+    if low.hasPrefix("ui·") || low.hasPrefix("ui.") || low.contains("抢焦点")
+        || low.contains("agent-desktop") || low.contains("posttopid")
+        || low.contains("已输入但提交") || low.contains("草稿提交")
+        || low.contains("打不开会话") || low.contains("找不到窗口") {
+        return "ui"
+    }
+    return "other"
+}
+
+func failKindLabel(_ kind: String) -> String {
+    switch kind {
+    case "rateLimit": return "限流"
+    case "tooling": return "工具"
+    case "ui": return "界面"
+    default: return "其他"
+    }
+}
+
 /// CUA tiers: write continue at most once → submit. Never activate / switch Space here.
 /// On success `method` is a short tag for 最近动作（agent-desktop / AX / PostToPid …）.
 func sendContinue(win: CGRect, wid: Int, name: String, pid: pid_t) -> (method: String?, error: String?) {
@@ -1597,8 +1621,15 @@ func runWatchDaemon() {
                                       "waitingSec": Int(lastPoll.timeIntervalSince(first)),
                                       "nextRunSec": next.sec,
                                       "nextRunAt": iso.string(from: lastPoll.addingTimeInterval(Double(next.sec)))]
-            if !next.hint.isEmpty { row["nextRunHint"] = next.hint }
-            if let e = b.errorMsg, !e.isEmpty { row["error"] = String(e.prefix(120)) }
+            if !next.hint.isEmpty {
+                row["nextRunHint"] = next.hint
+                row["attemptKind"] = classifyFailKind(next.hint)
+            }
+            if let e = b.errorMsg, !e.isEmpty {
+                let err = String(e.prefix(120))
+                row["error"] = err
+                row["failKind"] = classifyFailKind(err)
+            }
             if let id = b.threadId { row["threadId"] = id }
             badgeArr.append(row)
         }
@@ -1607,7 +1638,10 @@ func runWatchDaemon() {
             let since = lastPoll.timeIntervalSince(lastAttemptAt[t] ?? lastSendAt[t] ?? .distantPast)
             let w = waits[min(n, waits.count - 1)]
             var row: [String: Any] = ["title": t, "count": n, "remainSec": max(0, Int(w - since))]
-            if let why = lastFailReason[t], !why.isEmpty { row["reason"] = why }
+            if let why = lastFailReason[t], !why.isEmpty {
+                row["reason"] = why
+                row["failKind"] = classifyFailKind(why)
+            }
             backoffArr.append(row)
         }
         let elapsed = lastPoll.timeIntervalSince(startDate)
