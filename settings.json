@@ -7,6 +7,6 @@
   "useAgentDesktop": true,
   "agentDesktopPath": "/opt/homebrew/bin/agent-desktop",
   "useCodexQueue": true,
-  "codexPath": "/opt/homebrew/bin/codex",
-  "comment": "优先 codex queue；失败再短暂抢焦点用 AX/AD。无盲发。maxRuntimeHours: 0=永久。"
+  "codexPath": "auto",
+  "comment": "codexPath=auto 优先用 ChatGPT.app 自带 codex，其次 Homebrew。也可填绝对路径。maxRuntimeHours: 0=永久。"
 }

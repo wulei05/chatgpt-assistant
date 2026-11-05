@@ -47,6 +47,6 @@ each poll:
   "discoverMode": "files",
   "useAgentDesktop": true,
   "useCodexQueue": true,
-  "codexPath": "/opt/homebrew/bin/codex"
+  "codexPath": "auto"
 }
 ```

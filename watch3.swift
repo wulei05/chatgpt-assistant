@@ -35,7 +35,7 @@ func loadSettings() -> WatchSettings {
     var s = WatchSettings(maxRuntimeHours: 0, pollSec: 8, targetPid: 0, targetBundleId: "com.openai.codex",
                           discoverMode: "files", useAgentDesktop: true,
                           agentDesktopPath: "/opt/homebrew/bin/agent-desktop",
-                          useCodexQueue: true, codexPath: "/opt/homebrew/bin/codex")
+                          useCodexQueue: true, codexPath: "auto")
     guard let d = try? Data(contentsOf: URL(fileURLWithPath: settingsFile)),
           let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return s }
     if let h = o["maxRuntimeHours"] as? Double { s.maxRuntimeHours = h }
@@ -53,8 +53,26 @@ func loadSettings() -> WatchSettings {
     if let u = o["useAgentDesktop"] as? Bool { s.useAgentDesktop = u }
     if let p = o["agentDesktopPath"] as? String, !p.isEmpty { s.agentDesktopPath = p }
     if let u = o["useCodexQueue"] as? Bool { s.useCodexQueue = u }
-    if let p = o["codexPath"] as? String, !p.isEmpty { s.codexPath = p }
+    if let p = o["codexPath"] as? String { s.codexPath = p }
     return s
+}
+
+/// Prefer ChatGPT.app's native CLI (no node). `auto` / empty / legacy brew default → search order.
+func resolveCodexPath(_ preferred: String = settings.codexPath) -> String? {
+    let fm = FileManager.default
+    let trimmed = preferred.trimmingCharacters(in: .whitespacesAndNewlines)
+    let legacyBrew = "/opt/homebrew/bin/codex"
+    let useAuto = trimmed.isEmpty || trimmed == "auto" || trimmed == legacyBrew
+    if !useAuto, fm.isExecutableFile(atPath: trimmed) { return trimmed }
+
+    let candidates = [
+        // ChatGPT Desktop ships a Mach-O `codex` with `queue` — no Homebrew node needed.
+        "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+        "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
+        legacyBrew,
+        "/usr/local/bin/codex",
+    ]
+    return candidates.first { fm.isExecutableFile(atPath: $0) }
 }
 /// Shared mutable settings (used by helpers + runWatchDaemon).
 var settings = loadSettings()
@@ -176,11 +194,10 @@ func runCapture(_ path: String, _ args: [String], timeoutSec: Double = 45) -> (c
 }
 /// Space-proof continue via Codex CLI. nil = queued ok; else short error.
 func queueContinue(threadId: String, message: String = "continue") -> String? {
-    let bin = settings.codexPath
-    guard FileManager.default.isExecutableFile(atPath: bin) else {
-        return "找不到 codex：\(bin)"
+    guard let bin = resolveCodexPath() else {
+        return "找不到 codex（已试 ChatGPT.app 自带与 Homebrew）"
     }
-    log("  · codex queue --thread \(threadId.prefix(12))… --message \(message)")
+    log("  · codex queue (\(bin)) --thread \(threadId.prefix(12))… --message \(message)")
     let r = runCapture(bin, ["queue", "--thread", threadId, "--message", message], timeoutSec: 60)
     let joined = (r.out + "\n" + r.err).trimmingCharacters(in: .whitespacesAndNewlines)
     if r.code == 0, joined.localizedCaseInsensitiveContains("queued") || joined.isEmpty {
