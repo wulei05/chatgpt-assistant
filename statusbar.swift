@@ -308,14 +308,9 @@ final class Controller: NSObject, NSMenuDelegate {
                 ? (count > 0 ? "ChatGPT助手 · \(count) 条待继续" : "ChatGPT助手 · 空闲")
                 : "ChatGPT助手 · 未运行"
         }
-        // Keep open menu fresh (scan results / heartbeat) without dismissing it.
-        if menuIsOpen {
-            let fp = menuFingerprint(from: s)
-            if fp != lastMenuFingerprint {
-                lastMenuFingerprint = fp
-                menuNeedsUpdate(menu)
-            }
-        }
+        // Do not rebuild an open menu here. heartbeatAge/nextRunSec change every
+        // second; removeAllItems() tears down open submenus → flicker / dead clicks.
+        // Content refreshes on next open via NSMenuDelegate.menuNeedsUpdate.
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
