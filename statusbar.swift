@@ -702,13 +702,38 @@ final class Controller: NSObject, NSMenuDelegate {
         targetItem.submenu = targetMenu
         menu.addItem(targetItem)
 
-        // How it works — alert instead of disabled submenu (flyout items were unreachable).
-        let howItem = NSMenuItem(title: "实现原理…", action: #selector(showHowItWorks), keyEquivalent: "")
-        howItem.target = self
-        menu.addItem(howItem)
+        // How it works (SPEC summary). Submenu is safe again after stopping timer rebuilds.
+        let adOn = (cfg["useAgentDesktop"] as? Bool) ?? true
+        let howMenu = NSMenu(title: "实现原理")
+        func how(_ text: String, color: NSColor = .secondaryLabelColor) {
+            let i = NSMenuItem(title: text, action: nil, keyEquivalent: "")
+            i.attributedTitle = NSAttributedString(string: text, attributes: [
+                .foregroundColor: color,
+                .font: NSFont.menuFont(ofSize: 12)
+            ])
+            i.isEnabled = false
+            howMenu.addItem(i)
+        }
+        how("agent-desktop \(adOn ? "开" : "关")", color: .labelColor)
+        howMenu.addItem(.separator())
+        how("① 发现：运行记录 task_complete + error")
+        how("② 命名：session_index.thread_name")
+        how("③ 优先：codex queue --message continue")
+        how("④ 兜底：短暂抢焦点 → 打开会话")
+        how("   agent-desktop / AX set-value 发送")
+        how("⑤ 确认：运行记录变为 running")
+        how("   成功则写入 handled.txt")
+        howMenu.addItem(.separator())
+        how("立即扫描：清退避并马上重试")
+        how("已去掉：盲发 / 无 AX 坐标注入")
+        how("抢焦点仅在 queue 失败且卡住时")
+        howMenu.addItem(.separator())
         let openSpec = NSMenuItem(title: "打开 SPEC.md…", action: #selector(openSpec), keyEquivalent: "")
         openSpec.target = self
-        menu.addItem(openSpec)
+        howMenu.addItem(openSpec)
+        let howItem = NSMenuItem(title: "实现原理", action: nil, keyEquivalent: "")
+        howItem.submenu = howMenu
+        menu.addItem(howItem)
 
         let reveal = NSMenuItem(title: "打开日志", action: #selector(openLog), keyEquivalent: "")
         reveal.target = self
@@ -953,35 +978,6 @@ final class Controller: NSObject, NSMenuDelegate {
         a.alertStyle = .informational
         a.addButton(withTitle: "好")
         a.runModal()
-    }
-
-    @objc func showHowItWorks() {
-        let adOn = (readSettings()["useAgentDesktop"] as? Bool) ?? true
-        let body = """
-agent-desktop：\(adOn ? "开" : "关")
-
-① 发现：运行记录 task_complete + error
-② 命名：session_index.thread_name
-③ 优先：codex queue --message continue
-④ 兜底：短暂抢焦点 → 打开会话
-   agent-desktop / AX set-value 发送
-⑤ 确认：运行记录变为 running
-   成功则写入 handled.txt
-
-立即扫描：清退避并马上重试
-已去掉：盲发 / 无 AX 坐标注入
-抢焦点仅在 queue 失败且卡住时
-"""
-        let a = NSAlert()
-        a.messageText = "实现原理"
-        a.informativeText = body
-        a.alertStyle = .informational
-        a.addButton(withTitle: "打开 SPEC.md…")
-        a.addButton(withTitle: "关闭")
-        NSApp.activate(ignoringOtherApps: true)
-        if a.runModal() == .alertFirstButtonReturn {
-            openSpec()
-        }
     }
 
     @objc func openSpec() {
