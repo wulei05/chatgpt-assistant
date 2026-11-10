@@ -266,7 +266,9 @@ final class Controller: NSObject, NSMenuDelegate {
     func snapshot() -> (state: [String: Any]?, alive: Bool, paused: Bool, heartbeatAge: Double, badges: [[String: Any]], actions: [[String: Any]], backoff: [[String: Any]]) {
         let st = readJSON(statePath)
         let pid = (st?["pid"] as? Int) ?? -1
-        let alive = pidAlive(pid)
+        // STOP means user stopped monitoring. In-app watch shares CGPTBar's pid, so
+        // pidAlive(state.pid) stays true even after the watch thread exits.
+        let alive = !FileManager.default.fileExists(atPath: stopPath) && pidAlive(pid)
         var age: Double = -1
         if let hb = st?["heartbeat"] as? String {
             let f = ISO8601DateFormatter()
@@ -759,14 +761,18 @@ final class Controller: NSObject, NSMenuDelegate {
 
     @objc func stopWatch() {
         FileManager.default.createFile(atPath: stopPath, contents: nil)
-        // Fallback if STOP ignored
+        // Fallback only for a *separate* cgpt-daemon. In-app watch uses this process's
+        // pid in state.json — killing it would quit the menu bar app.
         DispatchQueue.global().async {
             Thread.sleep(forTimeInterval: 2.5)
-            if let st = readJSON(statePath), let pid = st["pid"] as? Int, pidAlive(pid) {
+            let myPid = Int(ProcessInfo.processInfo.processIdentifier)
+            if let st = readJSON(statePath), let pid = st["pid"] as? Int,
+               pid > 0, pid != myPid, pidAlive(pid) {
                 kill(pid_t(pid), SIGTERM)
             }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.refresh() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in self?.refresh() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in self?.refresh() }
     }
 
     @objc func togglePause() {
